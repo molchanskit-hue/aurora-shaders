@@ -1,0 +1,900 @@
+diff --git a/crates/horizon-client-render/src/gfx.rs b/crates/horizon-client-render/src/gfx.rs
+index 672c004..5d24dd7 100644
+--- a/crates/horizon-client-render/src/gfx.rs
++++ b/crates/horizon-client-render/src/gfx.rs
+@@ -77,6 +77,7 @@ mod flat;
+ mod hdr;
+ pub mod lightning;
+ mod lod;
++mod native_contact;
+ mod native_entity;
+ mod native_material;
+ mod native_pack;
+@@ -4716,8 +4717,19 @@ impl Renderer {
+             if let Some(shadow) = native.material.as_ref().and_then(|m| m.shadow.as_ref()) {
+                 shadow.prepare(&self.queue, frame);
+             }
+-            if let Some(scene) = native.material.as_mut().and_then(|m| m.scene.as_mut()) {
+-                scene.prepare(&self.device, &native.frame, (world_view, world_depth), size);
++            if let Some(material) = native.material.as_mut() {
++                if let Some(contact) = material.contact.as_mut() {
++                    contact.prepare(&self.device, size);
++                }
++                if let Some(scene) = material.scene.as_mut() {
++                    scene.prepare(
++                        &self.device,
++                        &native.frame,
++                        (world_view, world_depth),
++                        size,
++                        material.contact.as_ref().map(|c| &c.depth),
++                    );
++                }
+             }
+             if let Some(t) = &mut native.timing {
+                 t.begin(&self.device, &self.queue);
+@@ -4766,6 +4778,30 @@ impl Renderer {
+                 }
+             }
+         }
++        // forest.1: a fresh opaque depth image before any material reads it.
++        // Uses the same camera, alpha test and facing lists as the colour pass.
++        if !frame.title
++            && let Some(contact) = self
++                .native
++                .as_ref()
++                .and_then(|n| n.material.as_ref())
++                .and_then(|m| m.contact.as_ref())
++        {
++            let mut pass = contact.begin(&mut encoder);
++            pass.set_bind_group(0, &self.group, &[]);
++            pass.set_vertex_buffer(1, self.instances.slice(..));
++            pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
++            let mut page = None;
++            for i in 0..solid_draws as usize {
++                let (p, _) = self.draw_pages[i];
++                if page != Some(p) {
++                    pass.set_vertex_buffer(0, self.arena.buffer(p).slice(..));
++                    page = Some(p);
++                }
++                let d = self.draws[i];
++                pass.draw_indexed(d[2]..d[2] + d[0], d[3] as i32, d[4]..d[4] + 1);
++            }
++        }
+         if native_sky_pass
+             && let Some(native) = &mut self.native
+             && let Some(sky) = &native.sky
+diff --git a/crates/horizon-client-render/src/gfx/native_contact.rs b/crates/horizon-client-render/src/gfx/native_contact.rs
+new file mode 100644
+index 0000000..94f42f8
+--- /dev/null
++++ b/crates/horizon-client-render/src/gfx/native_contact.rs
+@@ -0,0 +1,157 @@
++//! forest.1: same-frame opaque terrain depth for material-local ambient occlusion.
++//! No history, colour, entities or water. Allocated only for the opt-in forest API.
++use super::native_material::{TerrainShape, vanilla_terrain};
++
++const ENTRIES: &str = "
++struct ContactVertex {
++    @builtin(position) clip: vec4<f32>,
++    @location(0) uv: vec2<f32>,
++    @location(1) @interpolate(flat) layer: u32,
++}
++@vertex fn vs_contact(@location(0) position: vec3<f32>, @location(1) uv: vec2<u32>,
++    @location(2) layer: u32, @location(5) origin: vec4<f32>) -> ContactVertex {
++    return ContactVertex(horizon_terrain_globals.view_proj * vec4(position + origin.xyz, 1.0),
++        horizon_terrain_terrain_uv(uv, origin.w), layer);
++}
++@fragment fn fs_contact(input: ContactVertex) {
++    let alpha = horizon_terrain_sprite(input.uv, input.layer & 0x7fffu).a;
++    if alpha < 0.5 && (input.layer & 0x8000u) == 0u { discard; }
++}
++";
++
++pub struct NativeContact {
++    pipeline: wgpu::RenderPipeline,
++    pub depth: wgpu::TextureView,
++    size: [u32; 2],
++}
++
++fn depth(device: &wgpu::Device, size: [u32; 2]) -> wgpu::TextureView {
++    device
++        .create_texture(&wgpu::TextureDescriptor {
++            label: Some("Aurora contact depth"),
++            size: wgpu::Extent3d {
++                width: size[0],
++                height: size[1],
++                depth_or_array_layers: 1,
++            },
++            mip_level_count: 1,
++            sample_count: 1,
++            dimension: wgpu::TextureDimension::D2,
++            format: wgpu::TextureFormat::Depth32Float,
++            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
++            view_formats: &[],
++        })
++        .create_view(&Default::default())
++}
++
++impl NativeContact {
++    pub fn new(device: &wgpu::Device, shape: &TerrainShape<'_>) -> Self {
++        let source = format!("{}\n{ENTRIES}", vanilla_terrain());
++        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
++            label: Some("Aurora contact depth"),
++            source: wgpu::ShaderSource::Wgsl(source.into()),
++        });
++        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
++            label: Some("Aurora contact depth"),
++            bind_group_layouts: &[Some(shape.globals)],
++            ..Default::default()
++        });
++        let constants = [
++            ("horizon_terrain_SPRITE_ARRAYS", shape.sprites[0]),
++            ("horizon_terrain_SPRITE_SPLIT", shape.sprites[1]),
++        ];
++        let options = wgpu::PipelineCompilationOptions {
++            constants: &constants,
++            ..Default::default()
++        };
++        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
++            label: Some("Aurora contact terrain prepass"),
++            layout: Some(&layout),
++            vertex: wgpu::VertexState {
++                module: &module,
++                entry_point: Some("vs_contact"),
++                compilation_options: options.clone(),
++                buffers: &[
++                    Some(wgpu::VertexBufferLayout {
++                        array_stride: size_of::<super::TerrainVertex>() as u64,
++                        step_mode: wgpu::VertexStepMode::Vertex,
++                        attributes: &super::TERRAIN_ATTRIBUTES,
++                    }),
++                    Some(wgpu::VertexBufferLayout {
++                        array_stride: 16,
++                        step_mode: wgpu::VertexStepMode::Instance,
++                        attributes: &wgpu::vertex_attr_array![5=>Float32x4],
++                    }),
++                ],
++            },
++            primitive: wgpu::PrimitiveState {
++                cull_mode: Some(wgpu::Face::Back),
++                ..Default::default()
++            },
++            depth_stencil: Some(wgpu::DepthStencilState {
++                format: wgpu::TextureFormat::Depth32Float,
++                depth_write_enabled: Some(true),
++                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
++                stencil: Default::default(),
++                bias: Default::default(),
++            }),
++            multisample: Default::default(),
++            fragment: Some(wgpu::FragmentState {
++                module: &module,
++                entry_point: Some("fs_contact"),
++                compilation_options: options,
++                targets: &[],
++            }),
++            multiview_mask: None,
++            cache: None,
++        });
++        Self {
++            pipeline,
++            depth: depth(device, [1, 1]),
++            size: [1, 1],
++        }
++    }
++    pub fn prepare(&mut self, device: &wgpu::Device, size: [u32; 2]) {
++        if self.size != size {
++            self.depth = depth(device, size);
++            self.size = size;
++        }
++    }
++    pub fn begin<'a>(&self, encoder: &'a mut wgpu::CommandEncoder) -> wgpu::RenderPass<'a> {
++        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
++            label: Some("Aurora contact terrain depth"),
++            color_attachments: &[],
++            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
++                view: &self.depth,
++                depth_ops: Some(wgpu::Operations {
++                    load: wgpu::LoadOp::Clear(0.0),
++                    store: wgpu::StoreOp::Store,
++                }),
++                stencil_ops: None,
++            }),
++            ..Default::default()
++        });
++        pass.set_pipeline(&self.pipeline);
++        pass
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn depth_prepass_composes_with_terrain() {
++        let source = format!("{}\n{ENTRIES}", vanilla_terrain());
++        let module = naga::front::wgsl::parse_str(&source).unwrap();
++        naga::valid::Validator::new(
++            naga::valid::ValidationFlags::all(),
++            naga::valid::Capabilities::all(),
++        )
++        .validate(&module)
++        .unwrap();
++    }
++}
++
++#[cfg(test)]
++#[path = "native_contact_gpu.rs"]
++mod gpu_tests;
+diff --git a/crates/horizon-client-render/src/gfx/native_contact_gpu.rs b/crates/horizon-client-render/src/gfx/native_contact_gpu.rs
+new file mode 100644
+index 0000000..4f26895
+--- /dev/null
++++ b/crates/horizon-client-render/src/gfx/native_contact_gpu.rs
+@@ -0,0 +1,280 @@
++//! GPU readback for the current-frame contact prepass: alpha, forced opacity, clear and resize.
++use super::*;
++use bytemuck::Zeroable;
++use wgpu::util::DeviceExt;
++#[test]
++fn contact_cutout_freshness_resize_on_gpu() {
++    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
++    let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
++        assert!(
++            std::env::var_os("AURORA_REQUIRE_GPU").is_none(),
++            "Metal adapter required for the Aurora preview"
++        );
++        eprintln!("SKIP sunlight GPU test: no adapter");
++        return;
++    };
++    eprintln!("Forest contact GPU: {:?}", adapter.get_info());
++    let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
++    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
++    let vf = wgpu::ShaderStages::VERTEX_FRAGMENT;
++    let entries: Vec<_> = (0..12)
++        .map(|binding| wgpu::BindGroupLayoutEntry {
++            binding,
++            visibility: vf,
++            count: None,
++            ty: match binding {
++                0 => wgpu::BindingType::Buffer {
++                    ty: wgpu::BufferBindingType::Uniform,
++                    has_dynamic_offset: false,
++                    min_binding_size: None,
++                },
++                2 | 4 => wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
++                b => wgpu::BindingType::Texture {
++                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
++                    view_dimension: if b == 3 {
++                        wgpu::TextureViewDimension::D2
++                    } else {
++                        wgpu::TextureViewDimension::D2Array
++                    },
++                    multisampled: false,
++                },
++            },
++        })
++        .collect();
++    let globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++        label: None,
++        entries: &entries,
++    });
++    let shape = TerrainShape {
++        globals: &globals_layout,
++        flat: None,
++        sprites: [1.0, 2048.0],
++        format: wgpu::TextureFormat::Rgba8Unorm,
++    };
++    let mut contact = NativeContact::new(&device, &shape);
++    let texture = device.create_texture(&wgpu::TextureDescriptor {
++        label: None,
++        size: wgpu::Extent3d {
++            width: 2,
++            height: 1,
++            depth_or_array_layers: 1,
++        },
++        mip_level_count: 1,
++        sample_count: 1,
++        dimension: wgpu::TextureDimension::D2,
++        format: wgpu::TextureFormat::Rgba8Unorm,
++        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
++        view_formats: &[],
++    });
++    queue.write_texture(
++        texture.as_image_copy(),
++        &[255, 255, 255, 255, 255, 255, 255, 0],
++        wgpu::TexelCopyBufferLayout {
++            offset: 0,
++            bytes_per_row: Some(8),
++            rows_per_image: None,
++        },
++        texture.size(),
++    );
++    let array = texture.create_view(&wgpu::TextureViewDescriptor {
++        dimension: Some(wgpu::TextureViewDimension::D2Array),
++        ..Default::default()
++    });
++    let flat = texture.create_view(&Default::default());
++    let sampler = device.create_sampler(&Default::default());
++    let globals = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
++        label: None,
++        contents: bytemuck::bytes_of(&super::super::Globals {
++            view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
++            ..super::super::Globals::zeroed()
++        }),
++        usage: wgpu::BufferUsages::UNIFORM,
++    });
++    let bindings: Vec<_> = (0..12)
++        .map(|binding| wgpu::BindGroupEntry {
++            binding,
++            resource: match binding {
++                0 => globals.as_entire_binding(),
++                2 | 4 => wgpu::BindingResource::Sampler(&sampler),
++                3 => wgpu::BindingResource::TextureView(&flat),
++                _ => wgpu::BindingResource::TextureView(&array),
++            },
++        })
++        .collect();
++    let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
++        label: None,
++        layout: &globals_layout,
++        entries: &bindings,
++    });
++    let points = [
++        ([-0.8, -0.8, 0.25], [0, 32768]),
++        ([0.8, -0.8, 0.25], [32768, 32768]),
++        ([0.8, 0.8, 0.25], [32768, 0]),
++        ([-0.8, 0.8, 0.25], [0, 0]),
++    ];
++    let mut points_data: Vec<super::super::TerrainVertex> = points
++        .into_iter()
++        .map(|(pos, uv)| {
++            let mut v = super::super::TerrainVertex::zeroed();
++            v.pos = pos;
++            v.uv = uv;
++            v
++        })
++        .collect();
++    let buffer = |data: &[u8], usage| {
++        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
++            label: None,
++            contents: data,
++            usage,
++        })
++    };
++    let vertices = buffer(
++        bytemuck::cast_slice(&points_data),
++        wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
++    );
++    let origins = buffer(
++        bytemuck::cast_slice(&[0.0_f32, 0.0, 0.0, 1.0 / 32768.0]),
++        wgpu::BufferUsages::VERTEX,
++    );
++    let indices = buffer(
++        bytemuck::cast_slice(&[0u32, 1, 2, 0, 2, 3]),
++        wgpu::BufferUsages::INDEX,
++    );
++
++    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++        label: None,
++        entries: &[super::super::native_post::texture_entry(
++            0,
++            wgpu::TextureSampleType::Depth,
++        )],
++    });
++    let shader=device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None,
++        source: wgpu::ShaderSource::Wgsl("@group(0) @binding(0) var z:texture_depth_2d;
++        @vertex fn vs(@builtin(vertex_index) i:u32)->@builtin(position) vec4<f32>{let p=vec2(f32((i<<1u)&2u),f32(i&2u));return vec4(p*2.0-1.0,0.0,1.0);}
++        @fragment fn fs(@builtin(position) p:vec4<f32>)->@location(0) vec4<f32>{return vec4(vec3(textureLoad(z,vec2<i32>(p.xy),0)),1.0);}".into()) });
++    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
++        label: None,
++        bind_group_layouts: &[Some(&layout)],
++        ..Default::default()
++    });
++    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
++        label: None,
++        layout: Some(&pipeline_layout),
++        vertex: wgpu::VertexState {
++            module: &shader,
++            entry_point: Some("vs"),
++            compilation_options: Default::default(),
++            buffers: &[],
++        },
++        fragment: Some(wgpu::FragmentState {
++            module: &shader,
++            entry_point: Some("fs"),
++            compilation_options: Default::default(),
++            targets: &[Some(wgpu::ColorTargetState {
++                format: wgpu::TextureFormat::Rgba8Unorm,
++                blend: None,
++                write_mask: wgpu::ColorWrites::ALL,
++            })],
++        }),
++        primitive: Default::default(),
++        depth_stencil: None,
++        multisample: Default::default(),
++        multiview_mask: None,
++        cache: None,
++    });
++    for size in [[8, 8], [16, 8]] {
++        contact.prepare(&device, size);
++        let sample = device.create_bind_group(&wgpu::BindGroupDescriptor {
++            label: None,
++            layout: &layout,
++            entries: &[wgpu::BindGroupEntry {
++                binding: 0,
++                resource: wgpu::BindingResource::TextureView(&contact.depth),
++            }],
++        });
++        let target = device.create_texture(&wgpu::TextureDescriptor {
++            label: None,
++            size: wgpu::Extent3d {
++                width: size[0],
++                height: size[1],
++                depth_or_array_layers: 1,
++            },
++            mip_level_count: 1,
++            sample_count: 1,
++            dimension: wgpu::TextureDimension::D2,
++            format: wgpu::TextureFormat::Rgba8Unorm,
++            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
++            view_formats: &[],
++        });
++        let view = target.create_view(&Default::default());
++        for mode in 0..3 {
++            for v in &mut points_data {
++                v.layer = if mode == 1 { 0x8000 } else { 0 };
++            }
++            queue.write_buffer(&vertices, 0, bytemuck::cast_slice(&points_data));
++            let mut encoder = device.create_command_encoder(&Default::default());
++            {
++                let mut pass = contact.begin(&mut encoder);
++                pass.set_bind_group(0, &group, &[]);
++                pass.set_vertex_buffer(0, vertices.slice(..));
++                pass.set_vertex_buffer(1, origins.slice(..));
++                pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
++                if mode != 2 {
++                    pass.draw_indexed(0..6, 0, 0..1);
++                }
++            }
++            {
++                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
++                    label: None,
++                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
++                        view: &view,
++                        depth_slice: None,
++                        resolve_target: None,
++                        ops: wgpu::Operations {
++                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
++                            store: wgpu::StoreOp::Store,
++                        },
++                    })],
++                    ..Default::default()
++                });
++                pass.set_pipeline(&pipeline);
++                pass.set_bind_group(0, &sample, &[]);
++                pass.draw(0..3, 0..1);
++            }
++            let read = device.create_buffer(&wgpu::BufferDescriptor {
++                label: None,
++                size: u64::from(256 * size[1]),
++                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
++                mapped_at_creation: false,
++            });
++            encoder.copy_texture_to_buffer(
++                target.as_image_copy(),
++                wgpu::TexelCopyBufferInfo {
++                    buffer: &read,
++                    layout: wgpu::TexelCopyBufferLayout {
++                        offset: 0,
++                        bytes_per_row: Some(256),
++                        rows_per_image: Some(size[1]),
++                    },
++                },
++                target.size(),
++            );
++            queue.submit([encoder.finish()]);
++            read.slice(..)
++                .map_async(wgpu::MapMode::Read, |r| r.unwrap());
++            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
++            let bytes = read.slice(..).get_mapped_range().unwrap();
++            for (x, want) in [
++                (size[0] / 4, if mode == 2 { 0u8 } else { 64 }),
++                (size[0] * 3 / 4, if mode == 1 { 64 } else { 0 }),
++            ] {
++                let got = bytes[(size[1] / 2 * 256 + x * 4) as usize];
++                assert!(
++                    got.abs_diff(want) <= 1,
++                    "size={size:?}, mode={mode}, x={x}: {got} != {want}"
++                );
++            }
++        }
++    }
++    assert!(pollster::block_on(scope.pop()).is_none());
++}
+diff --git a/crates/horizon-client-render/src/gfx/native_material.rs b/crates/horizon-client-render/src/gfx/native_material.rs
+index 071cfa6..a154c96 100644
+--- a/crates/horizon-client-render/src/gfx/native_material.rs
++++ b/crates/horizon-client-render/src/gfx/native_material.rs
+@@ -31,6 +31,7 @@ struct HorizonMaterialOut {
+     @location(7) cylindrical: f32,
+     @location(8) @interpolate(flat) is_water: u32,
+     @location(9) lighting: vec4<f32>,
++    @location(10) @interpolate(flat) is_leaves: u32,
+ }
+ fn horizon_material_vertex(position: vec3<f32>, uv: vec2<f32>, layer: u32, color: vec4<f32>,
+     light: vec2<u32>, origin: vec3<f32>, lighting: vec4<f32>) -> HorizonMaterialOut {
+@@ -41,6 +42,7 @@ fn horizon_material_vertex(position: vec3<f32>, uv: vec2<f32>, layer: u32, color
+     out.layer = layer;
+     out.tint = vec4(color.rgb, 1.0);
+     out.lighting = lighting;
++    out.is_leaves = select(0u, 1u, (u32(round(color.a * 255.0)) & 64u) == 0u);
+     // mesher::NOT_WATER_BIT: clear only for semantic fluid water, not glass.
+     out.is_water = select(0u, 1u, (u32(round(color.a * 255.0)) & 128u) == 0u);
+     let block = max(f32(light.y), horizon_terrain_dynamic_block_light(pos));
+@@ -103,6 +105,7 @@ pub struct TerrainShape<'a> {
+ /// renderer's instanced draws and, where they run, its flat ones.
+ pub struct NativeMaterial {
+     pub scene: Option<NativeScene>,
++    pub contact: Option<super::native_contact::NativeContact>,
+     pub shadow: Option<super::native_shadow::NativeShadow>,
+     pub solid: wgpu::RenderPipeline,
+     pub translucent: wgpu::RenderPipeline,
+@@ -148,6 +151,9 @@ fn horizon_material_fog(in: HorizonMaterialOut) -> vec4<f32> {
+             "horizon_material_fog(in), in.lighting));",
+         );
+     }
++    if stage.forest {
++        entries = entries.replace("in.lighting));", "in.lighting, in.is_leaves != 0u));");
++    }
+     format!(
+         "{}\n// Horizon's terrain (terrain.wgsl)\n{}{}",
+         stage.source,
+@@ -187,6 +193,9 @@ impl NativeMaterial {
+                 stage.sun_shadow_quality.unwrap_or_default(),
+             )
+         });
++        let contact = stage
++            .forest
++            .then(|| super::native_contact::NativeContact::new(device, shape));
+         let scene = stage
+             .scene_snapshot
+             .then(|| NativeScene::new(device, shape.format));
+@@ -300,6 +309,7 @@ impl NativeMaterial {
+         }
+         Ok(Self {
+             scene,
++            contact,
+             shadow,
+             solid,
+             translucent,
+diff --git a/crates/horizon-client-render/src/gfx/native_scene.rs b/crates/horizon-client-render/src/gfx/native_scene.rs
+index cf5be68..3df6091 100644
+--- a/crates/horizon-client-render/src/gfx/native_scene.rs
++++ b/crates/horizon-client-render/src/gfx/native_scene.rs
+@@ -46,6 +46,7 @@ impl NativeScene {
+                 texture_entry(1, float),
+                 texture_entry(2, wgpu::TextureSampleType::Depth),
+                 sampler_entry(3),
++                texture_entry(4, wgpu::TextureSampleType::Depth),
+             ],
+         });
+         let source_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+@@ -119,6 +120,7 @@ impl NativeScene {
+         frame: &NativeFrame,
+         world: (&wgpu::TextureView, &wgpu::TextureView),
+         size: [u32; 2],
++        contact: Option<&wgpu::TextureView>,
+     ) {
+         if self.targets.as_ref().is_none_or(|t| t.size != size) {
+             let target = |format| {
+@@ -158,6 +160,10 @@ impl NativeScene {
+                         binding: 2,
+                         resource: wgpu::BindingResource::TextureView(&depth),
+                     },
++                    wgpu::BindGroupEntry {
++                        binding: 4,
++                        resource: wgpu::BindingResource::TextureView(contact.unwrap_or(&depth)),
++                    },
+                     wgpu::BindGroupEntry {
+                         binding: 3,
+                         resource: wgpu::BindingResource::Sampler(&self.sampler),
+@@ -296,7 +302,7 @@ mod tests {
+             );
+             let view = output.create_view(&Default::default());
+             for (red, z) in [(0.25, 0.75), (0.5, 0.125)] {
+-                scene.prepare(&device, &frame, (&color, &depth), size);
++                scene.prepare(&device, &frame, (&color, &depth), size, None);
+                 let mut encoder = device.create_command_encoder(&Default::default());
+                 let clear = |encoder: &mut wgpu::CommandEncoder, red, z| {
+                     encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+diff --git a/crates/horizon-client-render/src/mesher.rs b/crates/horizon-client-render/src/mesher.rs
+index f090b4b..7761c18 100644
+--- a/crates/horizon-client-render/src/mesher.rs
++++ b/crates/horizon-client-render/src/mesher.rs
+@@ -107,6 +107,12 @@ impl TerrainVertex {
+         self.lighting = (pack_rgb(rgb) & 0x00FF_FFFF) | (ao << 24);
+         self
+     }
++    fn with_leaves(mut self, leaves: bool) -> Self {
++        if leaves {
++            self.color &= !NOT_LEAVES_BIT;
++        }
++        self
++    }
+     /// The UV the GPU samples.
+     pub fn uv(&self) -> [f32; 2] {
+         self.uv.map(|v| f32::from(v) / UV_STEPS)
+@@ -126,6 +132,22 @@ mod vertex_tests {
+         assert_eq!(v.with_lighting(None, 1.0).lighting, 0xFFFF_FFFF);
+     }
+     #[test]
++    fn semantic_leaves_preserve_colour_emission_and_water() {
++        for tier in 0..=4 {
++            let color = super::emitting(0xFF123456, tier);
++            let ordinary = TerrainVertex::new([0.0; 3], [0.0; 2], 7, color, 0xF0F0);
++            let leaf = ordinary.with_leaves(true);
++            assert_eq!(leaf.color ^ ordinary.color, super::NOT_LEAVES_BIT);
++            assert_eq!(
++                leaf.color & super::EMISSION_BITS,
++                color & super::EMISSION_BITS
++            );
++            assert_ne!(leaf.color & super::NOT_WATER_BIT, 0);
++            assert_eq!(ordinary.with_leaves(false).color, color);
++            assert_eq!(leaf.light, ordinary.light);
++        }
++    }
++    #[test]
+     fn model_uvs_pack_exactly() {
+         for i in 0..=32 {
+             let u = i as f32 / 32.0;
+@@ -720,6 +742,8 @@ pub const EMISSION_BITS: u32 = 0x0F00_0000;
+ /// existing color field and the low-nibble HDR tier; shaders never use vertex alpha
+ /// as opacity. Native material packs receive it as `MaterialInput.is_water`.
+ pub const NOT_WATER_BIT: u32 = 0x8000_0000;
++/// Clear only on semantic LeavesBlock faces; untouched constructors stay non-leaf.
++pub const NOT_LEAVES_BIT: u32 = 0x4000_0000;
+ /// HDR tiers, by the kind of light rather than its level: a candle's flame is as bright as
+ /// a torch's, it only lights less around it. 0 stays as in SDR.
+ pub const LOW: u8 = 1;
+@@ -1066,7 +1090,8 @@ impl Mesher<'_> {
+                     emitting(pack_rgb(rgb), tier),
+                     pack_coords(lighting::with_emission(coords[i], q.light_emission)),
+                 )
+-                .with_lighting(tint, ambient[i]),
++                .with_lighting(tint, ambient[i])
++                .with_leaves(state.leaves),
+             );
+         }
+     }
+diff --git a/crates/horizon-shader-api/src/check.rs b/crates/horizon-shader-api/src/check.rs
+index 406b73c..305b195 100644
+--- a/crates/horizon-shader-api/src/check.rs
++++ b/crates/horizon-shader-api/src/check.rs
+@@ -57,6 +57,7 @@ pub struct CheckedStage {
+     pub kind: StageKind,
+     pub temporal_api: bool,
+     pub clean_lighting: bool,
++    pub forest: bool,
+     pub resolution_divisor: u32,
+     pub history: bool,
+     /// The opt-in water.2 material stage needs a pre-translucent scene snapshot.
+@@ -189,6 +190,7 @@ pub fn check_stage(pack: &Pack, kind: StageKind, file: &str) -> Result<CheckedSt
+         kind,
+         temporal_api: crate::manifest::has_temporal(&pack.manifest.api),
+         clean_lighting: crate::manifest::has_clean_lighting(&pack.manifest.api),
++        forest: pack.manifest.api == crate::manifest::AURORA_FOREST_API,
+         resolution_divisor: post.and_then(|s| s.resolution_divisor).unwrap_or(1),
+         history: post.and_then(|s| s.history).unwrap_or(false),
+         sun_shadow: (matches!(kind, StageKind::Material | StageKind::Entity)
+diff --git a/crates/horizon-shader-api/src/contact_depth.wgsl b/crates/horizon-shader-api/src/contact_depth.wgsl
+new file mode 100644
+index 0000000..921e019
+--- /dev/null
++++ b/crates/horizon-shader-api/src/contact_depth.wgsl
+@@ -0,0 +1,7 @@
++// forest.1 material only: current frame opaque/cutout terrain, before shading.
++// Excludes water, entities, sky, hand and HUD. Reversed depth, 0 = sky.
++@group(3) @binding(4) var contact_depth: texture_depth_2d;
++fn contact_depth_at(uv: vec2<f32>) -> f32 {
++    let size = vec2<f32>(textureDimensions(contact_depth));
++    return textureLoad(contact_depth, vec2<i32>(clamp(uv * size, vec2(0.0), size - 1.0)), 0);
++}
+diff --git a/crates/horizon-shader-api/src/manifest.rs b/crates/horizon-shader-api/src/manifest.rs
+index 9536879..f1ff9c9 100644
+--- a/crates/horizon-shader-api/src/manifest.rs
++++ b/crates/horizon-shader-api/src/manifest.rs
+@@ -26,19 +26,31 @@ pub const AURORA_TEMPORAL_API: &str = "0.1-aurora-atmosphere.2";
+ pub const AURORA_LIGHTING_API: &str = "0.1-aurora-lighting.1";
+ /// Local opt-in entity/hand fragment hook, extending lighting.1.
+ pub const AURORA_ENTITY_API: &str = "0.1-aurora-lighting.2";
++/// Local semantic foliage and a same-frame, camera-space opaque depth prepass.
++pub const AURORA_FOREST_API: &str = "0.1-aurora-forest.1";
++pub fn has_entity(api: &str) -> bool {
++    matches!(api, AURORA_ENTITY_API | AURORA_FOREST_API)
++}
+ pub fn has_clean_lighting(api: &str) -> bool {
+-    matches!(api, AURORA_LIGHTING_API | AURORA_ENTITY_API)
++    matches!(
++        api,
++        AURORA_LIGHTING_API | AURORA_ENTITY_API | AURORA_FOREST_API
++    )
+ }
+ pub fn has_temporal(api: &str) -> bool {
+     matches!(
+         api,
+-        AURORA_TEMPORAL_API | AURORA_LIGHTING_API | AURORA_ENTITY_API
++        AURORA_TEMPORAL_API | AURORA_LIGHTING_API | AURORA_ENTITY_API | AURORA_FOREST_API
+     )
+ }
+ pub fn has_atmosphere(api: &str) -> bool {
+     matches!(
+         api,
+-        AURORA_ATMOSPHERE_API | AURORA_TEMPORAL_API | AURORA_LIGHTING_API | AURORA_ENTITY_API
++        AURORA_ATMOSPHERE_API
++            | AURORA_TEMPORAL_API
++            | AURORA_LIGHTING_API
++            | AURORA_ENTITY_API
++            | AURORA_FOREST_API
+     )
+ }
+ pub fn has_sun_shadow(api: &str) -> bool {
+@@ -50,6 +62,7 @@ pub fn has_sun_shadow(api: &str) -> bool {
+             | AURORA_TEMPORAL_API
+             | AURORA_LIGHTING_API
+             | AURORA_ENTITY_API
++            | AURORA_FOREST_API
+     )
+ }
+ pub fn has_water_environment(api: &str) -> bool {
+@@ -275,15 +288,16 @@ impl Manifest {
+             && raw.api != AURORA_TEMPORAL_API
+             && raw.api != AURORA_LIGHTING_API
+             && raw.api != AURORA_ENTITY_API
++            && raw.api != AURORA_FOREST_API
+         {
+             return Err(err(format!(
+-                "written for shader API {}; this Horizon serves {API}, {AURORA_WATER_API}, {AURORA_SCENE_API}, {AURORA_IMMERSION_API}, {AURORA_SHADOW_API}, {AURORA_SHADOW_QUALITY_API}, {AURORA_ATMOSPHERE_API}, {AURORA_TEMPORAL_API}, {AURORA_LIGHTING_API} and {AURORA_ENTITY_API}",
++                "written for shader API {}; this Horizon serves {API}, {AURORA_WATER_API}, {AURORA_SCENE_API}, {AURORA_IMMERSION_API}, {AURORA_SHADOW_API}, {AURORA_SHADOW_QUALITY_API}, {AURORA_ATMOSPHERE_API}, {AURORA_TEMPORAL_API}, {AURORA_LIGHTING_API}, {AURORA_ENTITY_API} and {AURORA_FOREST_API}",
+                 raw.api
+             )));
+         }
+-        if raw.entity.is_some() && raw.api != AURORA_ENTITY_API {
++        if raw.entity.is_some() && !has_entity(&raw.api) {
+             return Err(err(
+-                "[entity] requires local API 0.1-aurora-lighting.2".into()
++                "[entity] requires local API lighting.2 or forest.1".into()
+             ));
+         }
+         let id_ok = (1..=64).contains(&raw.id.len())
+@@ -314,6 +328,7 @@ impl Manifest {
+                 | AURORA_TEMPORAL_API
+                 | AURORA_LIGHTING_API
+                 | AURORA_ENTITY_API
++                | AURORA_FOREST_API
+         ) {
+             if raw.sun_shadows.is_none() || raw.material.is_none() {
+                 return Err(err(
+diff --git a/crates/horizon-shader-api/src/stages.rs b/crates/horizon-shader-api/src/stages.rs
+index 619a9e6..75f93fe 100644
+--- a/crates/horizon-shader-api/src/stages.rs
++++ b/crates/horizon-shader-api/src/stages.rs
+@@ -277,6 +277,13 @@ impl StageKind {
+         if self == StageKind::Material && crate::manifest::has_clean_lighting(api) {
+             out = out.replace("    fog: vec4<f32>,", "    fog: vec4<f32>,\n    // RGB: unshaded biome tint; alpha: AO, zero means unavailable.\n    lighting: vec4<f32>,");
+         }
++        if self == StageKind::Material && api == crate::manifest::AURORA_FOREST_API {
++            out = out.replace(
++                "    lighting: vec4<f32>,",
++                "    lighting: vec4<f32>,\n    is_leaves: bool,",
++            );
++            out += include_str!("contact_depth.wgsl");
++        }
+         if self == StageKind::Material && api == crate::manifest::AURORA_SHADOW_API {
+             out += include_str!("sun_shadow.wgsl");
+         }
+@@ -383,6 +390,14 @@ pub fn compose(pack: &Pack, kind: StageKind, file: &str) -> Composed {
+     } else {
+         entries
+     };
++    let entries = if kind == StageKind::Material
++        && pack.manifest.api == crate::manifest::AURORA_FOREST_API
++    {
++        entries.replace("    @location(8) lighting: vec4<f32>,", "    @location(8) lighting: vec4<f32>,\n    @location(9) @interpolate(flat) is_leaves: u32,")
++            .replace("in.lighting);", "in.lighting, in.is_leaves != 0u);")
++    } else {
++        entries
++    };
+     push("<entries>", &entries);
+     composed
+ }
+diff --git a/crates/horizon-shader-api/tests/forest.rs b/crates/horizon-shader-api/tests/forest.rs
+new file mode 100644
+index 0000000..58cb87d
+--- /dev/null
++++ b/crates/horizon-shader-api/tests/forest.rs
+@@ -0,0 +1,27 @@
++use horizon_shader_api::{MANIFEST, Pack, StageKind, check};
++#[test]
++fn forest_resources_are_material_only_and_old_api_stays_unchanged() {
++    let prelude = StageKind::Material.prelude_for("0.1-aurora-forest.1");
++    assert!(prelude.contains("is_leaves: bool"));
++    assert!(prelude.contains("@binding(4) var contact_depth"));
++    assert!(
++        !StageKind::Material
++            .prelude_for("0.1-aurora-lighting.2")
++            .contains("contact_depth")
++    );
++    for stage in [StageKind::Sky, StageKind::Entity, StageKind::Post] {
++        assert!(
++            !stage
++                .prelude_for("0.1-aurora-forest.1")
++                .contains("contact_depth")
++        );
++    }
++    let manifest = "schema=1\nid=\"forest_probe\"\nname=\"Forest probe\"\nversion=\"1\"\napi=\"0.1-aurora-forest.1\"\n[sun_shadows]\nquality=\"low\"\n[material]\nfile=\"m.wgsl\"\n[entity]\nfile=\"e.wgsl\"\n[[post]]\nfile=\"p.wgsl\"\n";
++    let files=[(MANIFEST,manifest),("m.wgsl","fn material(i:MaterialInput)->Surface {return Surface(vec4(select(i.lighting.rgb,vec3(contact_depth_at(i.screen_uv)),i.is_leaves),i.albedo.a),false);}"),
++        ("e.wgsl","fn entity(i:EntityInput)->vec4<f32>{return i.vanilla;}"),
++        ("p.wgsl","fn post(i:PostInput)->vec4<f32>{return i.color;}")]
++        .map(|(k,v)|(k.into(),v.as_bytes().to_vec())).into();
++    let report = check(&Pack::from_files(files).unwrap()).unwrap();
++    assert_eq!(report.stages.len(), 3);
++    assert!(report.stages.iter().all(|s| s.forest));
++}
+diff --git a/docs/aurora-forest-api.md b/docs/aurora-forest-api.md
+new file mode 100644
+index 0000000..4045e18
+--- /dev/null
++++ b/docs/aurora-forest-api.md
+@@ -0,0 +1,51 @@
++# Aurora forest.1 (local fork)
++
++Opt-in `api = "0.1-aurora-forest.1"` extends lighting.2 with terrain contact
++depth and semantic leaves. It is not an upstream Horizon API. Previous pack
++versions retain their stage contracts and do not allocate a contact prepass.
++
++## Contract
++
++- `MaterialInput.is_leaves: bool`: true for faces of `Info.leaves` blocks
++  (the registry's LeavesBlock class), not inferred from texture colour.
++- Group 3 binding 4: `contact_depth: texture_depth_2d`. The helper
++  `contact_depth_at(uv)` uses nearest texel loads, with clamped coordinates.
++- The texture contains **this frame's** opaque/cutout terrain depth at world
++  render resolution. Reversed depth: 0 is empty, 1 is near. Use the frame's
++  inverse projection and inverse view to reconstruct camera-relative positions.
++- Available only to the material hook. Excludes translucent terrain, water,
++  entities, sky, hand and HUD. The existing pre-translucent snapshot is unchanged.
++
++The depth prepass runs before sky and material shading. It uses the same
++terrain camera, visible section/facing lists, UV decoding, sprite alpha cutoff
++of 0.5 and layer bit 0x8000 for forced opacity. It clears every frame and
++reallocates at resolution changes. There is no reprojection or temporal history.
++
++TerrainVertex remains 28 bytes. A cleared bit 0x40000000 in packed colour marks
++leaves; RGB, low-nibble emission and water bit 0x80000000 remain intact. Meshing
++sets the bit from block semantics. Legacy constructors remain non-leaf.
++
++## Forest Light prototype
++
++The pack evaluates 8 screen directions with 3 samples per direction within
++2.4 blocks (configurable 0.5–3), rejects coplanar/sky/distant samples and fades
++out at 40–64 blocks. It attenuates only linear sky/ground fill, before display
++mapping. Existing vertex AO, direct sun, local light and model lighting remain
++separate. Thin-leaf transmission uses a short offset sun-map query, with
++daylight, weather and skylight guards. This is an approximation, not GI.
++
++Screen-space contact shading cannot see off-screen occluders or hidden layers;
++entities do not participate. The extra terrain pass has a GPU/CPU cost even
++with contact strength set to zero. Switch to the lighting.2 baseline pack to
++measure total feature overhead. No performance claim before actual Metal tests.
++
++## Validation
++
++CPU: shader API contract tests, mesher metadata preservation, actual composed
++terrain/sky/entity WGSL validation, build, rustfmt and scoped Clippy.
++GPU fixture `contact_cutout_freshness_resize_on_gpu` reads back cutout versus
++forced-opaque depth, an empty next frame and two resolutions. Require an actual
++adapter with `AURORA_REQUIRE_GPU=1`; a skipped test is not a hardware pass.
++The preview also checks shadow/history/model fixtures and the full pack's
++pipelines before starting a new isolated world. Visual contact strength,
++leaf transmission, edge artifacts and total frame cost still require gameplay.

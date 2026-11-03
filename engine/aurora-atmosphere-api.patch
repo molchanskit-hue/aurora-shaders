@@ -1,0 +1,755 @@
+From cb16c793533e7b4fa6109088833403155d1296d7 Mon Sep 17 00:00:00 2001
+From: "Laze ." <laze.@MacBook-Pro-50.local>
+Date: Fri, 30 Oct 2026 15:47:14 -0400
+Subject: [PATCH] Add opt-in sky ownership and volume shadow sampling for
+ Aurora
+
+Co-authored-by: Codex <noreply@openai.com>
+---
+ crates/horizon-client-render/src/gfx.rs       |  20 +++-
+ .../src/gfx/native_material.rs                |  21 ++++
+ .../src/gfx/native_pack.rs                    |  17 ++-
+ .../src/gfx/native_post.rs                    |  37 +++++-
+ .../src/gfx/native_shadow_tests.rs            | 113 +++++++++++++++++-
+ .../src/gfx/native_sky.rs                     |  21 ++++
+ crates/horizon-shader-api/src/check.rs        |  13 +-
+ crates/horizon-shader-api/src/manifest.rs     |  42 ++++++-
+ crates/horizon-shader-api/src/stages.rs       |  10 +-
+ crates/horizon-shader-api/src/sun_volume.wgsl |  15 +++
+ crates/horizon-shader-api/tests/check.rs      |  34 ++++++
+ crates/horizon-shader-api/tests/reference.rs  |  29 +++++
+ docs/api/aurora-atmosphere.md                 |  53 ++++++++
+ 13 files changed, 407 insertions(+), 18 deletions(-)
+ create mode 100644 crates/horizon-shader-api/src/sun_volume.wgsl
+ create mode 100644 docs/api/aurora-atmosphere.md
+
+diff --git a/crates/horizon-client-render/src/gfx.rs b/crates/horizon-client-render/src/gfx.rs
+index fdec3b9..87fee19 100644
+--- a/crates/horizon-client-render/src/gfx.rs
++++ b/crates/horizon-client-render/src/gfx.rs
+@@ -4916,7 +4916,15 @@ impl Renderer {
+                     if frame.end_sky {
+                         self.end_sky.draw(&mut pass);
+                     }
+-                    if celestial_vertices > 0 && !pack_draws_celestial {
++                    if celestial_vertices > 0
++                        && !pack_draws_celestial
++                        && !self.native.as_ref().is_some_and(|n| {
++                            n.atmosphere.custom_celestials
++                                && frame.skybox
++                                && !frame.end_sky
++                                && !frame.nether_lighting
++                        })
++                    {
+                         pass.set_vertex_buffer(0, self.celestial_buffer.slice(..));
+                         pass.draw_indexed(0..(celestial_vertices as u32 / 4) * 6, 0, 0..1);
+                     }
+@@ -5201,7 +5209,15 @@ impl Renderer {
+                     0..1,
+                 );
+             }
+-            if cloud_quads > 0 && !pack_draws_clouds {
++            if cloud_quads > 0
++                && !pack_draws_clouds
++                && !self.native.as_ref().is_some_and(|n| {
++                    n.atmosphere.custom_clouds
++                        && !frame.title
++                        && !frame.end_sky
++                        && !frame.nether_lighting
++                })
++            {
+                 pass.set_pipeline(&self.cloud_pipeline);
+                 pass.set_bind_group(0, &self.entity_group, &[]);
+                 pass.set_bind_group(1, &self.cloud_group, &[]);
+diff --git a/crates/horizon-client-render/src/gfx/native_material.rs b/crates/horizon-client-render/src/gfx/native_material.rs
+index 97c1e7b..be1edbc 100644
+--- a/crates/horizon-client-render/src/gfx/native_material.rs
++++ b/crates/horizon-client-render/src/gfx/native_material.rs
+@@ -434,4 +434,25 @@ mod tests {
+             .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&shader_source(&stage))));
+         }
+     }
++    #[test]
++    #[ignore = "developer harness: set HORIZON_VALIDATE_SHADER_PACK to a local pack"]
++    fn local_pack_composes_with_renderer() {
++        let path = std::env::var("HORIZON_VALIDATE_SHADER_PACK").expect("pack path");
++        let pack = Pack::read(std::path::Path::new(&path)).unwrap();
++        let report = check(&pack).unwrap();
++        let stage = report
++            .stages
++            .into_iter()
++            .find(|s| s.kind == horizon_shader_api::StageKind::Material)
++            .expect("stage");
++        let text = shader_source(&stage);
++        let module = naga::front::wgsl::parse_str(&text)
++            .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&text)));
++        naga::valid::Validator::new(
++            naga::valid::ValidationFlags::all(),
++            naga::valid::Capabilities::all(),
++        )
++        .validate(&module)
++        .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&text)));
++    }
+ }
+diff --git a/crates/horizon-client-render/src/gfx/native_pack.rs b/crates/horizon-client-render/src/gfx/native_pack.rs
+index ad563b9..cf9bf9a 100644
+--- a/crates/horizon-client-render/src/gfx/native_pack.rs
++++ b/crates/horizon-client-render/src/gfx/native_pack.rs
+@@ -9,6 +9,7 @@ use super::native_sky::NativeSky;
+ use super::pack_timing::PassTiming;
+ 
+ pub struct NativePack {
++    pub atmosphere: horizon_shader_api::manifest::Atmosphere,
+     pub water_environment: bool,
+     pub frame: NativeFrame,
+     pub sky: Option<NativeSky>,
+@@ -47,7 +48,20 @@ impl NativePack {
+             .map(|stage| NativeMaterial::new(device, terrain, &frame, stage, constants))
+             .transpose()?;
+         let post = (!post.is_empty())
+-            .then(|| NativePost::new(device, post, constants, format, &frame))
++            .then(|| {
++                if post.iter().any(|s| s.sun_shadow) {
++                    NativePost::with_shadow(
++                        device,
++                        post,
++                        constants,
++                        format,
++                        &frame,
++                        material.as_ref().and_then(|m| m.shadow.as_ref()),
++                    )
++                } else {
++                    NativePost::new(device, post, constants, format, &frame)
++                }
++            })
+             .transpose()?;
+         let mut labels: Vec<String> = sky.iter().map(|s| s.label.clone()).collect();
+         labels.extend(
+@@ -60,6 +74,7 @@ impl NativePack {
+             labels.extend(post.labels().into_iter().map(str::to_owned));
+         }
+         let pack = Self {
++            atmosphere: report.atmosphere,
+             water_environment,
+             frame,
+             sky,
+diff --git a/crates/horizon-client-render/src/gfx/native_post.rs b/crates/horizon-client-render/src/gfx/native_post.rs
+index 8866da9..9e4e0f2 100644
+--- a/crates/horizon-client-render/src/gfx/native_post.rs
++++ b/crates/horizon-client-render/src/gfx/native_post.rs
+@@ -18,6 +18,7 @@ type WorldViews = (wgpu::TextureView, wgpu::TextureView);
+ 
+ pub struct NativePost {
+     passes: Vec<(String, wgpu::RenderPipeline)>,
++    sun_shadow: Option<wgpu::BindGroup>,
+     layout: wgpu::BindGroupLayout,
+     frame: wgpu::Buffer,
+     linear: wgpu::Sampler,
+@@ -48,7 +49,7 @@ pub(super) fn frame_entry(visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayo
+         ty: wgpu::BindingType::Buffer {
+             ty: wgpu::BufferBindingType::Uniform,
+             has_dynamic_offset: false,
+-            min_binding_size: wgpu::BufferSize::new((size_of::<FrameInputs>() + 16) as u64),
++            min_binding_size: wgpu::BufferSize::new((size_of::<FrameInputs>() + 32) as u64),
+         },
+         count: None,
+     }
+@@ -58,7 +59,7 @@ impl NativeFrame {
+     pub fn new(device: &wgpu::Device) -> Self {
+         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+             label: Some("Native shader pack frame"),
+-            size: (size_of::<FrameInputs>() + 16) as u64,
++            size: (size_of::<FrameInputs>() + 32) as u64,
+             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+             mapped_at_creation: false,
+         });
+@@ -106,6 +107,17 @@ impl NativeFrame {
+             size_of::<FrameInputs>() as u64,
+             bytemuck::cast_slice(&frame.pack.aurora_water),
+         );
++        let atmosphere = [
++            (frame.pack.day_time.div_euclid(24000)).rem_euclid(8) as f32,
++            0.0,
++            0.0,
++            0.0,
++        ];
++        queue.write_buffer(
++            &self.buffer,
++            (size_of::<FrameInputs>() + 16) as u64,
++            bytemuck::cast_slice(&atmosphere),
++        );
+     }
+ }
+ 
+@@ -161,6 +173,22 @@ impl NativePost {
+         format: wgpu::TextureFormat,
+         frame: &NativeFrame,
+     ) -> Result<Self, String> {
++        Self::with_shadow(device, stages, constants, format, frame, None)
++    }
++
++    pub fn with_shadow(
++        device: &wgpu::Device,
++        stages: Vec<CheckedStage>,
++        constants: &[(String, f64)],
++        format: wgpu::TextureFormat,
++        frame: &NativeFrame,
++        shadow: Option<&super::native_shadow::NativeShadow>,
++    ) -> Result<Self, String> {
++        let needs_shadow = stages.iter().any(|s| s.sun_shadow);
++        let shadow = shadow.filter(|_| needs_shadow);
++        if needs_shadow && shadow.is_none() {
++            return Err("atmosphere post stages require the native sun shadow binding".into());
++        }
+         let float = wgpu::TextureSampleType::Float { filterable: true };
+         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+             label: Some("Native shader pack post"),
+@@ -175,6 +203,7 @@ impl NativePost {
+         });
+         let mut groups: [Option<&wgpu::BindGroupLayout>; GROUP as usize + 1] = Default::default();
+         groups[GROUP as usize] = Some(&layout);
++        groups[2] = shadow.map(|s| &s.layout);
+         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+             label: Some("Native shader pack post"),
+             bind_group_layouts: &groups,
+@@ -233,6 +262,7 @@ impl NativePost {
+         };
+         Ok(Self {
+             passes,
++            sun_shadow: shadow.map(|s| s.receiver.clone()),
+             layout,
+             frame: frame.buffer.clone(),
+             linear: sampler("Native shader pack linear", wgpu::FilterMode::Linear),
+@@ -371,6 +401,9 @@ impl NativePost {
+                 ..Default::default()
+             });
+             pass.set_pipeline(pipeline);
++            if let Some(shadow) = &self.sun_shadow {
++                pass.set_bind_group(2, shadow, &[]);
++            }
+             pass.set_bind_group(GROUP, group, &[]);
+             pass.draw(0..3, 0..1);
+         }
+diff --git a/crates/horizon-client-render/src/gfx/native_shadow_tests.rs b/crates/horizon-client-render/src/gfx/native_shadow_tests.rs
+index e8613a1..fb32a39 100644
+--- a/crates/horizon-client-render/src/gfx/native_shadow_tests.rs
++++ b/crates/horizon-client-render/src/gfx/native_shadow_tests.rs
+@@ -5,7 +5,7 @@ use wgpu::util::DeviceExt;
+ 
+ #[test]
+ fn cutout_caster_and_receiver_on_gpu() {
+-    run_receiver_test(None);
++    run_receiver_test(None, false);
+ }
+ 
+ #[test]
+@@ -16,11 +16,18 @@ fn quality_levels_on_gpu() {
+         SunShadowQuality::High,
+         SunShadowQuality::Ultra,
+     ] {
+-        run_receiver_test(Some(quality));
++        run_receiver_test(Some(quality), false);
+     }
+ }
+ 
+-fn run_receiver_test(recipe: Option<SunShadowQuality>) {
++#[test]
++fn atmosphere_post_on_gpu() {
++    for quality in [SunShadowQuality::Low, SunShadowQuality::High] {
++        run_receiver_test(Some(quality), true);
++    }
++}
++
++fn run_receiver_test(recipe: Option<SunShadowQuality>, atmosphere: bool) {
+     let quality = recipe.unwrap_or_default();
+     eprintln!("Sunlight recipe: {recipe:?}");
+     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+@@ -167,6 +174,66 @@ fn run_receiver_test(recipe: Option<SunShadowQuality>) {
+     let mut inputs = horizon_shader_api::Frame::zeroed();
+     inputs.sun_direction = [0.0, 1.0, 0.0];
+     queue.write_buffer(&frame.buffer, 0, bytemuck::bytes_of(&inputs));
++    queue.write_buffer(
++        &frame.buffer,
++        400,
++        bytemuck::cast_slice(&[0.25_f32, 1.0, 0.0, 0.0, 7.0, 0.0, 0.0, 0.0]),
++    );
++    let mut post = if atmosphere {
++        use horizon_shader_api::{MANIFEST, Pack, StageKind, check};
++        let manifest = format!(
++            "schema=1\nid=\"t\"\nname=\"T\"\nversion=\"1\"\napi=\"0.1-aurora-atmosphere.1\"\n[sun_shadows]\nquality=\"{}\"\n[material]\nfile=\"m.wgsl\"\n[[post]]\nfile=\"p.wgsl\"\n",
++            if quality == SunShadowQuality::Low {
++                "low"
++            } else {
++                "high"
++            }
++        );
++        let files = [(MANIFEST, manifest.as_str()),
++            ("m.wgsl", "fn material(i:MaterialInput)->Surface {return Surface(i.albedo,false);}"),
++            ("p.wgsl", "fn post(i:PostInput)->vec4<f32> {let v=sun_volume_visibility(vec3(i.uv.x*2.0-1.0,0.0,0.75)); return vec4(v,frame.atmosphere.x/7.0,frame.water.x,1.0);}")]
++            .map(|(k,v)|(k.into(),v.as_bytes().to_vec())).into();
++        let stages = check(&Pack::from_files(files).unwrap())
++            .unwrap()
++            .stages
++            .into_iter()
++            .filter(|s| s.kind == StageKind::Post)
++            .collect();
++        Some(
++            super::super::native_post::NativePost::with_shadow(
++                &device,
++                stages,
++                &[],
++                wgpu::TextureFormat::Rgba8Unorm,
++                &frame,
++                Some(&shadow),
++            )
++            .unwrap(),
++        )
++    } else {
++        None
++    };
++    let world = |format| {
++        device
++            .create_texture(&wgpu::TextureDescriptor {
++                label: None,
++                size: wgpu::Extent3d {
++                    width: 4,
++                    height: 1,
++                    depth_or_array_layers: 1,
++                },
++                mip_level_count: 1,
++                sample_count: 1,
++                dimension: wgpu::TextureDimension::D2,
++                format,
++                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
++                    | wgpu::TextureUsages::TEXTURE_BINDING,
++                view_formats: &[],
++            })
++            .create_view(&Default::default())
++    };
++    let world_color = world(wgpu::TextureFormat::Rgba8Unorm);
++    let world_depth = world(wgpu::TextureFormat::Depth32Float);
+     let source = horizon_shader_api::StageKind::Material.prelude_for_quality(
+         if recipe.is_some() {
+             "0.1-aurora-shadow.2"
+@@ -258,7 +325,38 @@ fn run_receiver_test(recipe: Option<SunShadowQuality>) {
+             pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+             pass.draw_indexed(0..6, 0, 0..1);
+         }
+-        {
++        if let Some(post) = &mut post {
++            {
++                let _clear = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
++                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
++                        view: &world_color,
++                        resolve_target: None,
++                        depth_slice: None,
++                        ops: wgpu::Operations {
++                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
++                            store: wgpu::StoreOp::Store,
++                        },
++                    })],
++                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
++                        view: &world_depth,
++                        depth_ops: Some(wgpu::Operations {
++                            load: wgpu::LoadOp::Clear(0.0),
++                            store: wgpu::StoreOp::Store,
++                        }),
++                        stencil_ops: None,
++                    }),
++                    ..Default::default()
++                });
++            }
++            post.run(
++                &device,
++                &mut encoder,
++                (&world_color, &world_depth),
++                &target_view,
++                [4, 1],
++                None,
++            );
++        } else {
+             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                 label: None,
+                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+@@ -309,6 +407,13 @@ fn run_receiver_test(recipe: Option<SunShadowQuality>) {
+         recv.recv().unwrap().unwrap();
+         let bytes = read.slice(..).get_mapped_range().unwrap();
+         for i in 0..4 {
++            if atmosphere {
++                assert_eq!(bytes[i * 4 + 1], 255, "lunar phase extension");
++                assert!(
++                    (i32::from(bytes[i * 4 + 2]) - 64).abs() <= 1,
++                    "water ABI preserved"
++                );
++            }
+             let want = if enabled && i < 2 { 0 } else { 255 };
+             assert!(
+                 (i32::from(bytes[i * 4]) - want).abs() <= 2,
+diff --git a/crates/horizon-client-render/src/gfx/native_sky.rs b/crates/horizon-client-render/src/gfx/native_sky.rs
+index 3b3c9a3..3b1b9f5 100644
+--- a/crates/horizon-client-render/src/gfx/native_sky.rs
++++ b/crates/horizon-client-render/src/gfx/native_sky.rs
+@@ -376,4 +376,25 @@ mod tests {
+             }
+         }
+     }
++    #[test]
++    #[ignore = "developer harness: set HORIZON_VALIDATE_SHADER_PACK to a local pack"]
++    fn local_pack_composes_with_renderer() {
++        let path = std::env::var("HORIZON_VALIDATE_SHADER_PACK").expect("pack path");
++        let pack = Pack::read(std::path::Path::new(&path)).unwrap();
++        let report = check(&pack).unwrap();
++        let stage = report
++            .stages
++            .into_iter()
++            .find(|s| s.kind == horizon_shader_api::StageKind::Sky)
++            .expect("stage");
++        let text = shader_source(&stage.source);
++        let module = naga::front::wgsl::parse_str(&text)
++            .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&text)));
++        naga::valid::Validator::new(
++            naga::valid::ValidationFlags::all(),
++            naga::valid::Capabilities::all(),
++        )
++        .validate(&module)
++        .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&text)));
++    }
+ }
+diff --git a/crates/horizon-shader-api/src/check.rs b/crates/horizon-shader-api/src/check.rs
+index a8de0a7..729ffce 100644
+--- a/crates/horizon-shader-api/src/check.rs
++++ b/crates/horizon-shader-api/src/check.rs
+@@ -74,6 +74,7 @@ pub struct CheckedStage {
+ 
+ #[derive(Debug)]
+ pub struct Report {
++    pub atmosphere: crate::manifest::Atmosphere,
+     pub water_environment: bool,
+     pub stages: Vec<CheckedStage>,
+ }
+@@ -121,6 +122,7 @@ pub fn check(pack: &Pack) -> Result<Report, Vec<Problem>> {
+     }
+     if problems.is_empty() {
+         Ok(Report {
++            atmosphere: m.atmosphere.unwrap_or_default(),
+             stages: checked,
+             water_environment: crate::manifest::has_water_environment(&m.api),
+         })
+@@ -177,9 +179,14 @@ pub fn check_stage(pack: &Pack, kind: StageKind, file: &str) -> Result<CheckedSt
+     }
+     Ok(CheckedStage {
+         kind,
+-        sun_shadow: kind == StageKind::Material
+-            && crate::manifest::has_sun_shadow(&pack.manifest.api),
+-        sun_shadow_quality: if kind == StageKind::Material {
++        sun_shadow: (kind == StageKind::Material
++            && crate::manifest::has_sun_shadow(&pack.manifest.api))
++            || (kind == StageKind::Post
++                && pack.manifest.api == crate::manifest::AURORA_ATMOSPHERE_API),
++        sun_shadow_quality: if kind == StageKind::Material
++            || (kind == StageKind::Post
++                && pack.manifest.api == crate::manifest::AURORA_ATMOSPHERE_API)
++        {
+             pack.manifest.sun_shadows.map(|s| s.quality)
+         } else {
+             None
+diff --git a/crates/horizon-shader-api/src/manifest.rs b/crates/horizon-shader-api/src/manifest.rs
+index d43b6dd..097f789 100644
+--- a/crates/horizon-shader-api/src/manifest.rs
++++ b/crates/horizon-shader-api/src/manifest.rs
+@@ -18,8 +18,13 @@ pub const AURORA_IMMERSION_API: &str = "0.1-aurora-water.3";
+ pub const AURORA_SHADOW_API: &str = "0.1-aurora-shadow.1";
+ /// Explicit allocation, range and filtering levels; shadow.1 remains unchanged.
+ pub const AURORA_SHADOW_QUALITY_API: &str = "0.1-aurora-shadow.2";
++/// Local sky ownership, lunar phase and shadow sampling in post stages.
++pub const AURORA_ATMOSPHERE_API: &str = "0.1-aurora-atmosphere.1";
+ pub fn has_sun_shadow(api: &str) -> bool {
+-    matches!(api, AURORA_SHADOW_API | AURORA_SHADOW_QUALITY_API)
++    matches!(
++        api,
++        AURORA_SHADOW_API | AURORA_SHADOW_QUALITY_API | AURORA_ATMOSPHERE_API
++    )
+ }
+ pub fn has_water_environment(api: &str) -> bool {
+     api == AURORA_IMMERSION_API || has_sun_shadow(api)
+@@ -85,6 +90,13 @@ impl SunShadowQuality {
+ pub struct SunShadows {
+     pub quality: SunShadowQuality,
+ }
++/// Opt-in ownership of vanilla sky layers; old API lines cannot request it.
++#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
++#[serde(default, deny_unknown_fields)]
++pub struct Atmosphere {
++    pub custom_celestials: bool,
++    pub custom_clouds: bool,
++}
+ /// Full-screen passes a pack may chain.
+ pub const MAX_POST_PASSES: usize = 8;
+ /// Options a pack may declare.
+@@ -109,6 +121,7 @@ pub struct Manifest {
+     pub sky: Option<Stage>,
+     pub material: Option<Stage>,
+     pub sun_shadows: Option<SunShadows>,
++    pub atmosphere: Option<Atmosphere>,
+     /// Full-screen passes, in the order they run.
+     pub post: Vec<Stage>,
+     pub options: Vec<PackOption>,
+@@ -178,6 +191,7 @@ struct Raw {
+     sky: Option<Stage>,
+     material: Option<Stage>,
+     sun_shadows: Option<SunShadows>,
++    atmosphere: Option<Atmosphere>,
+     #[serde(default)]
+     post: Vec<Stage>,
+     #[serde(default)]
+@@ -224,9 +238,10 @@ impl Manifest {
+             && raw.api != AURORA_IMMERSION_API
+             && raw.api != AURORA_SHADOW_API
+             && raw.api != AURORA_SHADOW_QUALITY_API
++            && raw.api != AURORA_ATMOSPHERE_API
+         {
+             return Err(err(format!(
+-                "written for shader API {}; this Horizon serves {API}, {AURORA_WATER_API}, {AURORA_SCENE_API}, {AURORA_IMMERSION_API}, {AURORA_SHADOW_API} and {AURORA_SHADOW_QUALITY_API}",
++                "written for shader API {}; this Horizon serves {API}, {AURORA_WATER_API}, {AURORA_SCENE_API}, {AURORA_IMMERSION_API}, {AURORA_SHADOW_API}, {AURORA_SHADOW_QUALITY_API} and {AURORA_ATMOSPHERE_API}",
+                 raw.api
+             )));
+         }
+@@ -251,14 +266,30 @@ impl Manifest {
+                 "this API requires a post stage to compose underwater fog".into(),
+             ));
+         }
+-        if raw.api == AURORA_SHADOW_QUALITY_API {
++        if matches!(
++            raw.api.as_str(),
++            AURORA_SHADOW_QUALITY_API | AURORA_ATMOSPHERE_API
++        ) {
+             if raw.sun_shadows.is_none() || raw.material.is_none() {
+                 return Err(err(
+-                    "shadow.2 requires [sun_shadows] quality and a [material] stage".into(),
++                    "shadow.2 / atmosphere.1 requires [sun_shadows] quality and a [material] stage"
++                        .into(),
+                 ));
+             }
+         } else if raw.sun_shadows.is_some() {
+-            return Err(err("[sun_shadows] requires API 0.1-aurora-shadow.2".into()));
++            return Err(err(
++                "[sun_shadows] requires API 0.1-aurora-shadow.2 or 0.1-aurora-atmosphere.1".into(),
++            ));
++        }
++        if let Some(atmosphere) = raw.atmosphere {
++            if raw.api != AURORA_ATMOSPHERE_API {
++                return Err(err(
++                    "[atmosphere] requires API 0.1-aurora-atmosphere.1".into()
++                ));
++            }
++            if atmosphere.custom_celestials && raw.sky.is_none() {
++                return Err(err("custom_celestials requires a [sky] stage".into()));
++            }
+         }
+         if raw.post.len() > MAX_POST_PASSES {
+             return Err(err(format!(
+@@ -307,6 +338,7 @@ impl Manifest {
+             sky: raw.sky,
+             material: raw.material,
+             sun_shadows: raw.sun_shadows,
++            atmosphere: raw.atmosphere,
+             post: raw.post,
+             options,
+             budget: Budget { gpu_ms },
+diff --git a/crates/horizon-shader-api/src/stages.rs b/crates/horizon-shader-api/src/stages.rs
+index 217bb17..1766f22 100644
+--- a/crates/horizon-shader-api/src/stages.rs
++++ b/crates/horizon-shader-api/src/stages.rs
+@@ -236,6 +236,9 @@ impl StageKind {
+             out = out.replace(&frame, &frame.replacen("}\n",
+                 "    // x: continuous water coverage, y: water environment enabled; z/w reserved.\n    water: vec4<f32>,\n}\n", 1));
+         }
++        if api == crate::manifest::AURORA_ATMOSPHERE_API {
++            out = out.replace("    water: vec4<f32>,", "    water: vec4<f32>,\n    // x: moon phase 0..7 (0 full); y/z/w reserved.\n    atmosphere: vec4<f32>,");
++        }
+         if self == StageKind::Material && crate::manifest::has_scene_snapshot(api) {
+             out = out.replace(&SURFACE.wgsl(),
+                 "// scene_composited skips engine fog; only for already composited scene colour.\nstruct Surface { color: vec4<f32>, scene_composited: bool, }\n");
+@@ -252,7 +255,9 @@ impl StageKind {
+         if self == StageKind::Material && api == crate::manifest::AURORA_SHADOW_API {
+             out += include_str!("sun_shadow.wgsl");
+         }
+-        if self == StageKind::Material && api == crate::manifest::AURORA_SHADOW_QUALITY_API {
++        if (self == StageKind::Material && api == crate::manifest::AURORA_SHADOW_QUALITY_API)
++            || (self != StageKind::Sky && api == crate::manifest::AURORA_ATMOSPHERE_API)
++        {
+             let radius = quality.pcf_radius();
+             out += &format!(
+                 "const horizon_sun_pcf_radius: i32 = {radius};\nconst horizon_sun_pcf_count: f32 = {}.0;\nconst horizon_sun_bias_scale: f32 = {:.8};\n",
+@@ -260,6 +265,9 @@ impl StageKind {
+                 quality.bias_scale()
+             );
+             out += include_str!("sun_shadow_quality.wgsl");
++            if self == StageKind::Post {
++                out += include_str!("sun_volume.wgsl");
++            }
+         }
+         out
+     }
+diff --git a/crates/horizon-shader-api/src/sun_volume.wgsl b/crates/horizon-shader-api/src/sun_volume.wgsl
+new file mode 100644
+index 0000000..ee9907f
+--- /dev/null
++++ b/crates/horizon-shader-api/src/sun_volume.wgsl
+@@ -0,0 +1,15 @@
++// atmosphere.1 post stages: one comparison per volume sample, no surface-normal bias.
++// Camera-relative world position; outside the local map is unoccluded.
++fn sun_volume_visibility(position: vec3<f32>) -> f32 {
++    if sun_shadow.parameters.w < 0.5 { return 1.0; }
++    let clip = sun_shadow.matrix * vec4(position, 1.0);
++    let uv = clip.xy * vec2(0.5, -0.5) + vec2(0.5);
++    if any(uv < vec2(0.01)) || any(uv > vec2(0.99)) || clip.z <= 0.0 || clip.z >= 1.0 {
++        return 1.0;
++    }
++    let visible = textureSampleCompareLevel(sun_shadow_depth, sun_shadow_sampler,
++        uv, clip.z - 0.00012 * horizon_sun_bias_scale);
++    let edge = smoothstep(0.0, 0.08, min(min(uv.x, uv.y), min(1.0-uv.x, 1.0-uv.y)));
++    let range = 1.0 - smoothstep(sun_shadow.parameters.y, sun_shadow.parameters.z, length(position));
++    return mix(1.0, visible, edge * range);
++}
+diff --git a/crates/horizon-shader-api/tests/check.rs b/crates/horizon-shader-api/tests/check.rs
+index 91b7570..40b9894 100644
+--- a/crates/horizon-shader-api/tests/check.rs
++++ b/crates/horizon-shader-api/tests/check.rs
+@@ -251,3 +251,37 @@ fn shadow_quality_recipes_translate_for_all_backends() {
+         assert!(!report.stages[1].sun_shadow);
+     }
+ }
++
++#[test]
++fn atmosphere_ownership_and_post_shadow_are_explicit() {
++    let manifest = "schema=1\nid=\"t\"\nname=\"T\"\nversion=\"1\"\napi=\"0.1-aurora-atmosphere.1\"\n[sun_shadows]\nquality=\"high\"\n[atmosphere]\ncustom_celestials=true\ncustom_clouds=true\n[sky]\nfile=\"s.wgsl\"\n[material]\nfile=\"m.wgsl\"\n[[post]]\nfile=\"p.wgsl\"\n";
++    let files = [(MANIFEST, manifest),
++        ("s.wgsl", "fn sky(i: SkyInput) -> vec4<f32> { return i.color * frame.atmosphere.x; }"),
++        ("m.wgsl", "fn material(i: MaterialInput) -> Surface { return Surface(i.albedo,false); }"),
++        ("p.wgsl", "fn post(i: PostInput) -> vec4<f32> { return i.color * sun_volume_visibility(view_position(i.uv, i.depth)); }")]
++        .map(|(k,v)| (k.into(), v.as_bytes().to_vec())).into();
++    let pack = Pack::from_files(files).unwrap();
++    let report = check(&pack).unwrap();
++    assert!(report.atmosphere.custom_celestials && report.atmosphere.custom_clouds);
++    assert!(!report.stages[0].sun_shadow);
++    assert!(report.stages[2].sun_shadow);
++    // Older packs must neither claim these layers nor see the new inputs/functions.
++    let old = manifest.replace("0.1-aurora-atmosphere.1", "0.1-aurora-shadow.2");
++    assert!(horizon_shader_api::manifest::Manifest::parse(&old).is_err());
++    let mut files = pack.files;
++    files.insert(
++        MANIFEST.into(),
++        old.replace(
++            "[atmosphere]\ncustom_celestials=true\ncustom_clouds=true\n",
++            "",
++        )
++        .into_bytes(),
++    );
++    assert!(check(&Pack::from_files(files).unwrap()).is_err());
++    assert!(
++        horizon_shader_api::manifest::Manifest::parse(
++            &manifest.replace("[sky]\nfile=\"s.wgsl\"\n", "")
++        )
++        .is_err()
++    );
++}
+diff --git a/crates/horizon-shader-api/tests/reference.rs b/crates/horizon-shader-api/tests/reference.rs
+index 729e3d7..dd19c47 100644
+--- a/crates/horizon-shader-api/tests/reference.rs
++++ b/crates/horizon-shader-api/tests/reference.rs
+@@ -143,3 +143,32 @@ fn immersion_frame_appends_one_aligned_vector_without_changing_legacy_fields() {
+         }
+     }
+ }
++
++#[test]
++fn atmosphere_frame_preserves_water_and_appends_lunar_phase() {
++    for kind in StageKind::ALL {
++        let module = validate(&kind.prelude_for("0.1-aurora-atmosphere.1"));
++        let (_, ty) = module
++            .types
++            .iter()
++            .find(|(_, t)| t.name.as_deref() == Some("Frame"))
++            .unwrap();
++        let naga::TypeInner::Struct { members, span } = &ty.inner else {
++            panic!("Frame struct")
++        };
++        assert_eq!(*span as usize, size_of::<Frame>() + 32);
++        assert_eq!(members[members.len() - 2].name.as_deref(), Some("water"));
++        assert_eq!(
++            members[members.len() - 2].offset as usize,
++            size_of::<Frame>()
++        );
++        assert_eq!(members.last().unwrap().name.as_deref(), Some("atmosphere"));
++        assert_eq!(
++            members.last().unwrap().offset as usize,
++            size_of::<Frame>() + 16
++        );
++        for (member, offset) in members.iter().zip(Frame::OFFSETS) {
++            assert_eq!(member.offset as usize, *offset);
++        }
++    }
++}
+diff --git a/docs/api/aurora-atmosphere.md b/docs/api/aurora-atmosphere.md
+new file mode 100644
+index 0000000..2fac60e
+--- /dev/null
++++ b/docs/api/aurora-atmosphere.md
+@@ -0,0 +1,53 @@
++# Aurora atmosphere.1 — local experimental extension
++
++Opt-in API `0.1-aurora-atmosphere.1`, built on `0.1-aurora-shadow.2`.
++Stock Horizon rejects it. This is a local renderer extension, not a published upstream API.
++Existing API lines keep their shader inputs and rendering policy.
++
++```toml
++api = "0.1-aurora-atmosphere.1"
++[sun_shadows]
++quality = "high"
++[atmosphere]
++custom_celestials = true
++custom_clouds = true
++```
++
++As in shadow.2, a material stage and explicit shadow quality are required; the water
++environment contract also requires a post stage. The atmosphere table is optional;
++both switches default to false. Custom celestials require a sky stage. Unknown fields
++and atmosphere ownership on an earlier API are rejected at manifest validation.
++
++`custom_celestials` omits the native sun/moon textured quads in the Overworld sky.
++`custom_clouds` omits the native cloud draw in Overworld gameplay. Native stars, the
++below-horizon dark disc, title panorama, Nether and End policies remain as before.
++The pack supplies its replacement sky bodies and cloud rendering. Disabling a
++pack or selecting a legacy pack restores the normal layer policy.
++
++The shared frame appends `atmosphere: vec4<f32>` after the existing `water` field:
++the legacy fields occupy bytes 0..400, water starts at 400, atmosphere starts at 416,
++and the extended uniform is 432 bytes. `atmosphere.x` is the game world's lunar
++phase, `floor(day_time / 24000) mod 8`, with 0 full and 4 new; y/z/w are reserved.
++The renderer allocates the larger buffer for all packs; earlier WGSL structs are unchanged.
++
++Post stages additionally bind the existing native shadow receiver at group 2,
++with the same depth image, comparison sampler and 80-byte uniform used by materials.
++There is no extra shadow map allocation or caster pass. `sun_volume_visibility(p)`
++performs one comparison at camera-relative world position `p`, with edge/range fading.
++It returns 1 outside the map and when disabled. `sun_shadow.parameters.w` lets a pack
++skip scattering when the map is inactive (Low, night, unsupported dimension).
++Material PCF filtering retains its shadow.2 contract.
++
++This API does not provide multiple scattering, cloud shadows on terrain, temporal
++cloud accumulation, half-resolution post passes, or depth for transparent particles.
++The pack still owns integration and composition. Post stages run after world rendering
++and before the hand/HUD; depth is the world's reversed scene depth. In particular,
++cloud composition cannot sort independently against transparent geometry absent from
++that depth. The original `scene_color` is unchanged by earlier post stages, so a bloom
++pass that recombines with it must precede cloud/ray composition.
++
++Validation includes legacy API tests, all three shader backends, extended uniform layout,
++and a required-GPU test using the actual NativePost pipeline: an opaque caster must
++occlude, a cutout must transmit, disabled/Low must return full visibility, and both water
++and lunar phase fields must survive the upload. Run real GPU tests with
++`AURORA_REQUIRE_GPU=1 <render-test-binary> gfx::native_shadow::gpu_tests --test-threads=1`.
+-- 
+2.50.1 (Apple Git-155)
+

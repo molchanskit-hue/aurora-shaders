@@ -1,0 +1,982 @@
+From 0bb1f5577a07be404a24920b4159d1fdfc2080d1 Mon Sep 17 00:00:00 2001
+From: "Laze ." <laze.@MacBook-Pro-50.local>
+Date: Fri, 30 Oct 2026 12:55:36 -0400
+Subject: [PATCH] Add opt-in scene snapshot and fog contract for Aurora water
+ depth
+
+Capture colour and depth before translucent terrain for API water.2, preserve legacy layouts, and validate snapshot freshness and resizing on GPU.
+
+Co-Authored-By: Codex <noreply@openai.com>
+---
+ crates/horizon-client-render/src/gfx.rs       |  43 +-
+ .../src/gfx/native_material.rs                |  65 ++-
+ .../src/gfx/native_post.rs                    |  25 +-
+ .../src/gfx/native_scene.rs                   | 378 ++++++++++++++++++
+ crates/horizon-shader-api/src/check.rs        |  11 +-
+ crates/horizon-shader-api/src/manifest.rs     |   6 +-
+ crates/horizon-shader-api/src/stages.rs       |  46 ++-
+ crates/horizon-shader-api/tests/check.rs      |  29 ++
+ crates/horizon-shader-api/tests/schema.rs     |   3 +-
+ docs/api/aurora-water.md                      |  58 +++
+ 10 files changed, 633 insertions(+), 31 deletions(-)
+ create mode 100644 crates/horizon-client-render/src/gfx/native_scene.rs
+ create mode 100644 docs/api/aurora-water.md
+
+diff --git a/crates/horizon-client-render/src/gfx.rs b/crates/horizon-client-render/src/gfx.rs
+index 8dc5051..5338a9b 100644
+--- a/crates/horizon-client-render/src/gfx.rs
++++ b/crates/horizon-client-render/src/gfx.rs
+@@ -80,6 +80,7 @@ mod lod;
+ mod native_material;
+ mod native_pack;
+ mod native_post;
++mod native_scene;
+ mod native_sky;
+ mod occlusion;
+ mod pack_atlas;
+@@ -121,14 +122,14 @@ fn sky_visible(frame: &Frame) -> bool {
+     !frame.title && frame.skybox && sky_open(frame)
+ }
+ 
+-fn world_pass_after_culling<'e>(
++fn resume_world_pass<'e>(
+     encoder: &'e mut wgpu::CommandEncoder,
+     view: &wgpu::TextureView,
+     depth: &wgpu::TextureView,
+     keep_depth: bool,
+ ) -> wgpu::RenderPass<'e> {
+     encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+-        label: Some("Horizon world, after culling"),
++        label: Some("Horizon world, resumed"),
+         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+             view,
+             resolve_target: None,
+@@ -4654,7 +4655,13 @@ impl Renderer {
+                 .then(|| pack_timing::PassTiming::new(&self.device, &self.queue))
+                 .flatten();
+         }
+-        let pack_reads_world = pack_post || native_post;
++        let native_scene = !frame.title
++            && self
++                .native
++                .as_ref()
++                .and_then(|n| n.material.as_ref())
++                .is_some_and(|m| m.scene.is_some());
++        let pack_reads_world = pack_post || native_post || native_scene;
+         // Phase 2 of occlusion culling draws over the depth, and a shader pack or TAA reads it.
+         let keep_depth = pack_reads_world || (taa && self.world_post.taa);
+         // The pack's program reads the vertices this frame's draws bind.
+@@ -4732,7 +4739,12 @@ impl Renderer {
+                 .size()
+                 .filter(|_| scaled.is_some())
+                 .unwrap_or([self.config.width, self.config.height]);
+-            native.frame.write(&self.queue, frame, size);
++            native
++                .frame
++                .write(&self.queue, frame, size, native_scene.then_some(jittered));
++            if let Some(scene) = native.material.as_mut().and_then(|m| m.scene.as_mut()) {
++                scene.prepare(&self.device, &native.frame, (world_view, world_depth), size);
++            }
+             if let Some(t) = &mut native.timing {
+                 t.begin(&self.device, &self.queue);
+                 native_sky_pass =
+@@ -4774,11 +4786,10 @@ impl Renderer {
+         }
+         // One of Horizon's own packs with a material stage: terrain draws with its pipelines,
+         // which read the pack's frame at group 3.
+-        let material = self
+-            .native
+-            .as_ref()
+-            .filter(|_| !frame.title)
+-            .and_then(|n| Some((n.material.as_ref()?, &n.frame.group)));
++        let material = self.native.as_ref().filter(|_| !frame.title).and_then(|n| {
++            let m = n.material.as_ref()?;
++            Some((m, m.scene.as_ref().map_or(&n.frame.group, |s| s.group())))
++        });
+         let solid_pipeline = material.map_or(&self.solid, |(m, _)| &m.solid);
+         let translucent_pipeline = material.map_or(&self.translucent, |(m, _)| &m.translucent);
+         let pack_flat = material.and_then(|(m, _)| m.flat.as_ref());
+@@ -4859,6 +4870,8 @@ impl Renderer {
+                     pass.draw(0..3, 0..1);
+                 }
+             }
++            // Native sky binds the frame-only group; the material may need scene textures.
++            pack_frame(&mut pass);
+             match self
+                 .flat
+                 .as_ref()
+@@ -4879,7 +4892,7 @@ impl Renderer {
+                             drop(pass);
+                             cull.test_pass(&mut encoder);
+                             flat.flatten_phase2(&mut encoder);
+-                            pass = world_pass_after_culling(
++                            pass = resume_world_pass(
+                                 &mut encoder,
+                                 world_view,
+                                 world_depth,
+@@ -4909,7 +4922,7 @@ impl Renderer {
+                             cull.test(&mut pass);
+                             drop(pass);
+                             cull.test_pass(&mut encoder);
+-                            pass = world_pass_after_culling(
++                            pass = resume_world_pass(
+                                 &mut encoder,
+                                 world_view,
+                                 world_depth,
+@@ -5050,6 +5063,14 @@ impl Renderer {
+                 pass.set_vertex_buffer(0, self.debug_line_buffer.slice(..));
+                 pass.draw(0..4, debug_depth..debug_depth + debug_top);
+             }
++            if let Some(scene) = material.and_then(|(m, _)| m.scene.as_ref()) {
++                drop(pass);
++                scene.capture(&mut encoder);
++                pass = resume_world_pass(&mut encoder, world_view, world_depth, keep_depth);
++                pass.set_bind_group(0, &self.group, &[]);
++                pack_frame(&mut pass);
++                pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
++            }
+             match self.flat.as_ref().filter(|_| flat_frame) {
+                 // The pack draws translucent terrain after its deferred programs.
+                 _ if pack_draws_water => {}
+diff --git a/crates/horizon-client-render/src/gfx/native_material.rs b/crates/horizon-client-render/src/gfx/native_material.rs
+index 69d0b71..706f752 100644
+--- a/crates/horizon-client-render/src/gfx/native_material.rs
++++ b/crates/horizon-client-render/src/gfx/native_material.rs
+@@ -11,6 +11,7 @@
+ use horizon_shader_api::{check::CheckedStage, stages::GROUP};
+ 
+ use super::native_post::{NativeFrame, present_constants};
++use super::native_scene::NativeScene;
+ use super::wgsl_prefix::{TERRAIN, prefixed, section};
+ 
+ const PREFIX: &str = "horizon_terrain_";
+@@ -99,6 +100,7 @@ pub struct TerrainShape<'a> {
+ /// The pack's terrain pipelines: solid (with the cutout test) and translucent, for the
+ /// renderer's instanced draws and, where they run, its flat ones.
+ pub struct NativeMaterial {
++    pub scene: Option<NativeScene>,
+     pub solid: wgpu::RenderPipeline,
+     pub translucent: wgpu::RenderPipeline,
+     pub flat: Option<(wgpu::RenderPipeline, wgpu::RenderPipeline)>,
+@@ -114,16 +116,40 @@ fn vanilla_terrain() -> String {
+ }
+ 
+ /// The terrain shader for the pack's material stage `source`.
+-fn shader_source(source: &str) -> String {
++fn shader_source(stage: &CheckedStage) -> String {
++    let mut entries = ENTRIES.to_owned();
++    if stage.scene_snapshot {
++        entries += "
++fn horizon_material_fog(in: HorizonMaterialOut) -> vec4<f32> {
++    let g = horizon_terrain_globals.fog;
++    let f = max(horizon_terrain_linear_fog(in.spherical, g.x, g.y),
++        horizon_terrain_linear_fog(in.cylindrical, g.z, g.w));
++    return vec4(horizon_terrain_globals.fog_color.rgb, f * horizon_terrain_globals.fog_color.a);
++}
++";
++        entries = entries
++            .replace("translucent && in.is_water != 0u)).color;",
++                "translucent && in.is_water != 0u, in.clip.xy / frame.resolution, horizon_material_fog(in)));")
++            .replace("fn horizon_material_color(in: HorizonMaterialOut, translucent: bool) -> vec4<f32>",
++                "fn horizon_material_color(in: HorizonMaterialOut, translucent: bool) -> Surface")
++            .replace("let color = horizon_material_color(in, false);",
++                "let color = horizon_material_color(in, false).color;")
++            .replace("let color = horizon_material_color(in, true);",
++                "let surface = horizon_material_color(in, true); let color = surface.color;")
++            .replace("return horizon_terrain_apply_fog(color, in.spherical, in.cylindrical);",
++                "if surface.scene_composited { return color; }\n    return horizon_terrain_apply_fog(color, in.spherical, in.cylindrical);");
++    }
+     format!(
+-        "{source}\n// Horizon's terrain (terrain.wgsl)\n{}{ENTRIES}",
+-        vanilla_terrain()
++        "{}\n// Horizon's terrain (terrain.wgsl)\n{}{}",
++        stage.source,
++        vanilla_terrain(),
++        entries
+     )
+ }
+ 
+ /// The material's naga module, its errors in the stage's file.
+ fn module(stage: &CheckedStage) -> Result<naga::Module, String> {
+-    let text = shader_source(&stage.source);
++    let text = shader_source(stage);
+     naga::front::wgsl::parse_str(&text)
+         .map_err(|e| format!("{}: {}", stage.file, e.emit_to_string(&text)))
+ }
+@@ -145,6 +171,9 @@ impl NativeMaterial {
+         ];
+         constants.extend(sprite_names.into_iter().zip(shape.sprites));
+         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
++        let scene = stage
++            .scene_snapshot
++            .then(|| NativeScene::new(device, shape.format));
+         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+             label: Some(&stage.label),
+             source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(module)),
+@@ -154,7 +183,7 @@ impl NativeMaterial {
+                 Default::default();
+             groups[0] = Some(shape.globals);
+             groups[1] = flat;
+-            groups[GROUP as usize] = Some(&frame.layout);
++            groups[GROUP as usize] = Some(scene.as_ref().map_or(&frame.layout, |s| &s.layout));
+             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                 label: Some("Native shader pack terrain"),
+                 bind_group_layouts: &groups,
+@@ -253,6 +282,7 @@ impl NativeMaterial {
+             return Err(format!("{}: {e}", stage.file));
+         }
+         Ok(Self {
++            scene,
+             solid,
+             translucent,
+             flat,
+@@ -266,11 +296,16 @@ mod tests {
+     use horizon_shader_api::{MANIFEST, Pack, StageKind, check};
+ 
+     fn stage(material: &str) -> CheckedStage {
++        stage_for(material, "0.1")
++    }
++
++    fn stage_for(material: &str, api: &str) -> CheckedStage {
+         let manifest = "schema = 1\nid = \"t\"\nname = \"T\"\nversion = \"1\"\napi = \"0.1\"\n\
+             [material]\nfile = \"material.wgsl\"\n\
+             [[options]]\nid = \"gain\"\nname = \"Gain\"\ntype = \"float\"\n\
+             default = 1.0\nmin = 0.0\nmax = 2.0\n";
+-        let files = [(MANIFEST, manifest), ("material.wgsl", material)]
++        let manifest = manifest.replace("api = \"0.1\"", &format!("api = \"{api}\""));
++        let files = [(MANIFEST, manifest.as_str()), ("material.wgsl", material)]
+             .map(|(n, t)| (n.to_owned(), t.as_bytes().to_vec()))
+             .into();
+         let mut report = check(&Pack::from_files(files).unwrap()).unwrap();
+@@ -310,7 +345,7 @@ mod tests {
+             naga::valid::Capabilities::all(),
+         )
+         .validate(&module)
+-        .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&shader_source(&stage.source))));
++        .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&shader_source(&stage))));
+         let entries: Vec<&str> = module
+             .entry_points
+             .iter()
+@@ -330,4 +365,20 @@ mod tests {
+             [("gain", 1.5)]
+         );
+     }
++    #[test]
++    fn scene_material_composes_with_the_real_terrain_entries() {
++        let stage = stage_for(
++            "override gain: f32; fn material(i: MaterialInput) -> Surface {
++            let c = textureSampleLevel(pre_translucent_color, scene_sampler, i.screen_uv, 0.0);
++            return Surface(c * gain, i.translucent); }",
++            "0.1-aurora-water.2",
++        );
++        let module = module(&stage).unwrap();
++        naga::valid::Validator::new(
++            naga::valid::ValidationFlags::all(),
++            naga::valid::Capabilities::all(),
++        )
++        .validate(&module)
++        .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&shader_source(&stage))));
++    }
+ }
+diff --git a/crates/horizon-client-render/src/gfx/native_post.rs b/crates/horizon-client-render/src/gfx/native_post.rs
+index bf42931..f5203c8 100644
+--- a/crates/horizon-client-render/src/gfx/native_post.rs
++++ b/crates/horizon-client-render/src/gfx/native_post.rs
+@@ -41,7 +41,7 @@ pub struct NativeFrame {
+ }
+ 
+ /// The uniform `frame` at binding 0, read by `visibility`.
+-fn frame_entry(visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
++pub(super) fn frame_entry(visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
+     wgpu::BindGroupLayoutEntry {
+         binding: 0,
+         visibility,
+@@ -84,9 +84,21 @@ impl NativeFrame {
+     }
+ 
+     /// Writes this frame's inputs, for a world of `size`.
+-    pub fn write(&mut self, queue: &wgpu::Queue, frame: &Frame, size: [u32; 2]) {
++    pub fn write(
++        &mut self,
++        queue: &wgpu::Queue,
++        frame: &Frame,
++        size: [u32; 2],
++        world_view_projection: Option<Mat4>,
++    ) {
+         let seconds = self.start.elapsed().as_secs_f32() % 3600.0;
+-        let inputs = frame_inputs(frame, size, seconds, self.frames);
++        let mut inputs = frame_inputs(frame, size, seconds, self.frames);
++        // water.2 reconstructs the exact current scene, including TAA jitter and camera effects.
++        if let Some(vp) = world_view_projection {
++            let projection = vp * Mat4::from_cols_array_2d(&inputs.view_inverse);
++            inputs.projection = projection.to_cols_array_2d();
++            inputs.projection_inverse = projection.inverse().to_cols_array_2d();
++        }
+         self.frames = self.frames.wrapping_add(1);
+         queue.write_buffer(&self.buffer, 0, bytemuck::bytes_of(&inputs));
+     }
+@@ -109,7 +121,10 @@ pub fn present_constants<'a>(
+         .collect()
+ }
+ 
+-fn texture_entry(binding: u32, sample_type: wgpu::TextureSampleType) -> wgpu::BindGroupLayoutEntry {
++pub(super) fn texture_entry(
++    binding: u32,
++    sample_type: wgpu::TextureSampleType,
++) -> wgpu::BindGroupLayoutEntry {
+     wgpu::BindGroupLayoutEntry {
+         binding,
+         visibility: wgpu::ShaderStages::FRAGMENT,
+@@ -122,7 +137,7 @@ fn texture_entry(binding: u32, sample_type: wgpu::TextureSampleType) -> wgpu::Bi
+     }
+ }
+ 
+-fn sampler_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
++pub(super) fn sampler_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+     wgpu::BindGroupLayoutEntry {
+         binding,
+         visibility: wgpu::ShaderStages::FRAGMENT,
+diff --git a/crates/horizon-client-render/src/gfx/native_scene.rs b/crates/horizon-client-render/src/gfx/native_scene.rs
+new file mode 100644
+index 0000000..cf5be68
+--- /dev/null
++++ b/crates/horizon-client-render/src/gfx/native_scene.rs
+@@ -0,0 +1,378 @@
++//! Opt-in water.2 snapshot, taken immediately before translucent terrain.
++//! A separate fullscreen pass preserves colour AND reversed depth without ever
++//! sampling the active terrain attachments. Earlier items/weather are included;
++//! translucent terrain, later particles and clouds are not. No temporal history.
++
++use super::native_post::{NativeFrame, frame_entry, sampler_entry, texture_entry};
++
++const COPY: &str = "
++@group(0) @binding(1) var color: texture_2d<f32>;
++@group(0) @binding(2) var depth: texture_depth_2d;
++@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
++    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
++    return vec4(p * 2.0 - 1.0, 0.0, 1.0);
++}
++struct Out { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32, }
++@fragment fn fs(@builtin(position) p: vec4<f32>) -> Out {
++    let pixel = vec2<i32>(p.xy);
++    return Out(textureLoad(color, pixel, 0), textureLoad(depth, pixel, 0));
++}
++";
++
++struct Targets {
++    size: [u32; 2],
++    color: wgpu::TextureView,
++    depth: wgpu::TextureView,
++    material: wgpu::BindGroup,
++}
++
++pub struct NativeScene {
++    pub layout: wgpu::BindGroupLayout,
++    source_layout: wgpu::BindGroupLayout,
++    pipeline: wgpu::RenderPipeline,
++    sampler: wgpu::Sampler,
++    format: wgpu::TextureFormat,
++    targets: Option<Targets>,
++    source: Option<((wgpu::TextureView, wgpu::TextureView), wgpu::BindGroup)>,
++}
++
++impl NativeScene {
++    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
++        let float = wgpu::TextureSampleType::Float { filterable: true };
++        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++            label: Some("Aurora pre-translucent material inputs"),
++            entries: &[
++                frame_entry(wgpu::ShaderStages::VERTEX_FRAGMENT),
++                texture_entry(1, float),
++                texture_entry(2, wgpu::TextureSampleType::Depth),
++                sampler_entry(3),
++            ],
++        });
++        let source_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++            label: Some("Aurora scene snapshot source"),
++            entries: &[
++                texture_entry(1, float),
++                texture_entry(2, wgpu::TextureSampleType::Depth),
++            ],
++        });
++        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
++            label: Some("Aurora scene snapshot"),
++            source: wgpu::ShaderSource::Wgsl(COPY.into()),
++        });
++        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
++            label: None,
++            bind_group_layouts: &[Some(&source_layout)],
++            ..Default::default()
++        });
++        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
++            label: Some("Aurora scene snapshot"),
++            layout: Some(&pipeline_layout),
++            vertex: wgpu::VertexState {
++                module: &shader,
++                entry_point: Some("vs"),
++                compilation_options: Default::default(),
++                buffers: &[],
++            },
++            primitive: Default::default(),
++            depth_stencil: Some(wgpu::DepthStencilState {
++                format: wgpu::TextureFormat::Depth32Float,
++                depth_write_enabled: Some(true),
++                depth_compare: Some(wgpu::CompareFunction::Always),
++                stencil: Default::default(),
++                bias: Default::default(),
++            }),
++            multisample: Default::default(),
++            fragment: Some(wgpu::FragmentState {
++                module: &shader,
++                entry_point: Some("fs"),
++                compilation_options: Default::default(),
++                targets: &[Some(wgpu::ColorTargetState {
++                    format,
++                    blend: None,
++                    write_mask: wgpu::ColorWrites::ALL,
++                })],
++            }),
++            multiview_mask: None,
++            cache: None,
++        });
++        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
++            label: Some("Aurora scene sampler"),
++            mag_filter: wgpu::FilterMode::Linear,
++            min_filter: wgpu::FilterMode::Linear,
++            ..Default::default()
++        });
++        Self {
++            layout,
++            source_layout,
++            pipeline,
++            sampler,
++            format,
++            targets: None,
++            source: None,
++        }
++    }
++
++    /// Called before borrowing the terrain pipelines. Rebind on resize or target change.
++    pub fn prepare(
++        &mut self,
++        device: &wgpu::Device,
++        frame: &NativeFrame,
++        world: (&wgpu::TextureView, &wgpu::TextureView),
++        size: [u32; 2],
++    ) {
++        if self.targets.as_ref().is_none_or(|t| t.size != size) {
++            let target = |format| {
++                device
++                    .create_texture(&wgpu::TextureDescriptor {
++                        label: Some("Aurora pre-translucent snapshot"),
++                        size: wgpu::Extent3d {
++                            width: size[0],
++                            height: size[1],
++                            depth_or_array_layers: 1,
++                        },
++                        mip_level_count: 1,
++                        sample_count: 1,
++                        dimension: wgpu::TextureDimension::D2,
++                        format,
++                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
++                            | wgpu::TextureUsages::TEXTURE_BINDING,
++                        view_formats: &[],
++                    })
++                    .create_view(&Default::default())
++            };
++            let color = target(self.format);
++            let depth = target(wgpu::TextureFormat::Depth32Float);
++            let material = device.create_bind_group(&wgpu::BindGroupDescriptor {
++                label: Some("Aurora pre-translucent material inputs"),
++                layout: &self.layout,
++                entries: &[
++                    wgpu::BindGroupEntry {
++                        binding: 0,
++                        resource: frame.buffer.as_entire_binding(),
++                    },
++                    wgpu::BindGroupEntry {
++                        binding: 1,
++                        resource: wgpu::BindingResource::TextureView(&color),
++                    },
++                    wgpu::BindGroupEntry {
++                        binding: 2,
++                        resource: wgpu::BindingResource::TextureView(&depth),
++                    },
++                    wgpu::BindGroupEntry {
++                        binding: 3,
++                        resource: wgpu::BindingResource::Sampler(&self.sampler),
++                    },
++                ],
++            });
++            self.targets = Some(Targets {
++                size,
++                color,
++                depth,
++                material,
++            });
++        }
++        if self
++            .source
++            .as_ref()
++            .is_some_and(|((c, d), _)| c == world.0 && d == world.1)
++        {
++            return;
++        }
++        let source = device.create_bind_group(&wgpu::BindGroupDescriptor {
++            label: Some("Aurora scene snapshot source"),
++            layout: &self.source_layout,
++            entries: &[
++                wgpu::BindGroupEntry {
++                    binding: 1,
++                    resource: wgpu::BindingResource::TextureView(world.0),
++                },
++                wgpu::BindGroupEntry {
++                    binding: 2,
++                    resource: wgpu::BindingResource::TextureView(world.1),
++                },
++            ],
++        });
++        self.source = Some(((world.0.clone(), world.1.clone()), source));
++    }
++
++    pub fn group(&self) -> &wgpu::BindGroup {
++        &self
++            .targets
++            .as_ref()
++            .expect("scene prepared before terrain")
++            .material
++    }
++
++    pub fn capture(&self, encoder: &mut wgpu::CommandEncoder) {
++        let t = self
++            .targets
++            .as_ref()
++            .expect("scene prepared before terrain");
++        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
++            label: Some("Aurora pre-translucent scene capture"),
++            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
++                view: &t.color,
++                resolve_target: None,
++                depth_slice: None,
++                ops: wgpu::Operations {
++                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
++                    store: wgpu::StoreOp::Store,
++                },
++            })],
++            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
++                view: &t.depth,
++                depth_ops: Some(wgpu::Operations {
++                    load: wgpu::LoadOp::Clear(0.0),
++                    store: wgpu::StoreOp::Store,
++                }),
++                stencil_ops: None,
++            }),
++            ..Default::default()
++        });
++        pass.set_pipeline(&self.pipeline);
++        pass.set_bind_group(
++            0,
++            &self.source.as_ref().expect("scene source prepared").1,
++            &[],
++        );
++        pass.draw(0..3, 0..1);
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::super::native_post::NativePost;
++    use super::*;
++    use horizon_shader_api::{MANIFEST, Pack, check};
++
++    // Exercise an actual GPU: the source can change after capture, resize rebinds
++    // both images, and a second frame must replace (not reuse) the snapshot.
++    #[test]
++    fn snapshot_is_independent_fresh_and_resized() {
++        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
++        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
++            eprintln!("SKIP native_scene GPU test: no adapter");
++            return;
++        };
++        eprintln!("Snapshot test adapter: {:?}", adapter.get_info());
++        let (device, queue) =
++            pollster::block_on(adapter.request_device(&Default::default())).unwrap();
++        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
++        let format = wgpu::TextureFormat::Rgba8Unorm;
++        let frame = NativeFrame::new(&device);
++        let mut scene = NativeScene::new(&device, format);
++        let manifest = "schema=1\nid=\"t\"\nname=\"Test\"\nversion=\"1\"\napi=\"0.1\"\n[[post]]\nfile=\"a.wgsl\"\n";
++        let shader = "fn post(i: PostInput) -> vec4<f32> { return vec4(i.color.rgb, i.depth); }";
++        let files = [(MANIFEST, manifest), ("a.wgsl", shader)]
++            .map(|(k, v)| (k.into(), v.as_bytes().to_vec()))
++            .into();
++        let report = check(&Pack::from_files(files).unwrap()).unwrap();
++        let mut post = NativePost::new(&device, report.stages, &[], format, &frame).unwrap();
++        for size in [[4, 4], [8, 4]] {
++            let texture = |format, usage| {
++                device.create_texture(&wgpu::TextureDescriptor {
++                    label: None,
++                    size: wgpu::Extent3d {
++                        width: size[0],
++                        height: size[1],
++                        depth_or_array_layers: 1,
++                    },
++                    mip_level_count: 1,
++                    sample_count: 1,
++                    dimension: wgpu::TextureDimension::D2,
++                    format,
++                    usage,
++                    view_formats: &[],
++                })
++            };
++            let usage =
++                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
++            let color = texture(format, usage).create_view(&Default::default());
++            let depth =
++                texture(wgpu::TextureFormat::Depth32Float, usage).create_view(&Default::default());
++            let output = texture(
++                format,
++                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
++            );
++            let view = output.create_view(&Default::default());
++            for (red, z) in [(0.25, 0.75), (0.5, 0.125)] {
++                scene.prepare(&device, &frame, (&color, &depth), size);
++                let mut encoder = device.create_command_encoder(&Default::default());
++                let clear = |encoder: &mut wgpu::CommandEncoder, red, z| {
++                    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
++                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
++                            view: &color,
++                            resolve_target: None,
++                            depth_slice: None,
++                            ops: wgpu::Operations {
++                                load: wgpu::LoadOp::Clear(wgpu::Color {
++                                    r: red,
++                                    g: 0.25,
++                                    b: 0.5,
++                                    a: 1.0,
++                                }),
++                                store: wgpu::StoreOp::Store,
++                            },
++                        })],
++                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
++                            view: &depth,
++                            depth_ops: Some(wgpu::Operations {
++                                load: wgpu::LoadOp::Clear(z),
++                                store: wgpu::StoreOp::Store,
++                            }),
++                            stencil_ops: None,
++                        }),
++                        ..Default::default()
++                    });
++                };
++                clear(&mut encoder, red, z);
++                scene.capture(&mut encoder);
++                clear(&mut encoder, 1.0, 0.0);
++                let targets = scene.targets.as_ref().unwrap();
++                post.run(
++                    &device,
++                    &mut encoder,
++                    (&targets.color, &targets.depth),
++                    &view,
++                    size,
++                    None,
++                );
++                let buffer = device.create_buffer(&wgpu::BufferDescriptor {
++                    label: None,
++                    size: u64::from(256 * size[1]),
++                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
++                    mapped_at_creation: false,
++                });
++                encoder.copy_texture_to_buffer(
++                    output.as_image_copy(),
++                    wgpu::TexelCopyBufferInfo {
++                        buffer: &buffer,
++                        layout: wgpu::TexelCopyBufferLayout {
++                            offset: 0,
++                            bytes_per_row: Some(256),
++                            rows_per_image: Some(size[1]),
++                        },
++                    },
++                    output.size(),
++                );
++                queue.submit([encoder.finish()]);
++                buffer
++                    .slice(..)
++                    .map_async(wgpu::MapMode::Read, |r| r.unwrap());
++                device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
++                let bytes = buffer.slice(..).get_mapped_range().unwrap();
++                for y in 0..size[1] as usize {
++                    for x in 0..size[0] as usize {
++                        let pixel = &bytes[y * 256 + x * 4..y * 256 + x * 4 + 4];
++                        let want = [(red * 255.0) as u8, 64, 128, (z * 255.0) as u8];
++                        assert!(
++                            pixel.iter().zip(want).all(|(a, b)| a.abs_diff(b) <= 1),
++                            "{pixel:?} != {want:?}, size {size:?}"
++                        );
++                    }
++                }
++            }
++        }
++        assert!(pollster::block_on(scope.pop()).is_none());
++    }
++}
+diff --git a/crates/horizon-shader-api/src/check.rs b/crates/horizon-shader-api/src/check.rs
+index c3ecdd1..54781a4 100644
+--- a/crates/horizon-shader-api/src/check.rs
++++ b/crates/horizon-shader-api/src/check.rs
+@@ -55,6 +55,8 @@ fn problem(file: &str, message: impl Into<String>) -> Problem {
+ #[derive(Debug)]
+ pub struct CheckedStage {
+     pub kind: StageKind,
++    /// The opt-in water.2 material stage needs a pre-translucent scene snapshot.
++    pub scene_snapshot: bool,
+     pub file: String,
+     /// The manifest's name for it, else its file.
+     pub label: String,
+@@ -130,7 +132,7 @@ pub fn check_stage(pack: &Pack, kind: StageKind, file: &str) -> Result<CheckedSt
+     own.text.truncate(entries.1.start);
+     let module = parse(&own)?;
+     let mut problems = signature(&module, kind, file);
+-    problems.extend(api_rules(&module, kind, &own));
++    problems.extend(api_rules(&module, &own));
+     problems.extend(options(&module, &pack.manifest.options, file));
+     if !problems.is_empty() {
+         return Err(problems);
+@@ -169,6 +171,8 @@ pub fn check_stage(pack: &Pack, kind: StageKind, file: &str) -> Result<CheckedSt
+     }
+     Ok(CheckedStage {
+         kind,
++        scene_snapshot: kind == StageKind::Material
++            && pack.manifest.api == crate::manifest::AURORA_SCENE_API,
+         file: file.to_owned(),
+         label: file.to_owned(),
+         module,
+@@ -279,8 +283,9 @@ fn names(module: &naga::Module) -> HashSet<String> {
+ 
+ /// A pack's files declare no bindings, no entry points and no `horizon_`
+ /// names: what the prelude doesn't define is the pack's.
+-fn api_rules(module: &naga::Module, kind: StageKind, own: &Composed) -> Vec<Problem> {
+-    let prelude = naga::front::wgsl::parse_str(&kind.prelude()).expect("the prelude parses");
++fn api_rules(module: &naga::Module, own: &Composed) -> Vec<Problem> {
++    let prelude = naga::front::wgsl::parse_str(&own.text[own.parts[0].1.clone()])
++        .expect("the prelude parses");
+     let ours = names(&prelude);
+     let file = &own.parts[own.parts.len() - 1].0;
+     let mut problems = Vec::new();
+diff --git a/crates/horizon-shader-api/src/manifest.rs b/crates/horizon-shader-api/src/manifest.rs
+index 711c76f..63e99a5 100644
+--- a/crates/horizon-shader-api/src/manifest.rs
++++ b/crates/horizon-shader-api/src/manifest.rs
+@@ -10,6 +10,8 @@ pub const SCHEMA: u32 = 1;
+ pub const API: &str = "0.1";
+ /// Experimental local Aurora extension, deliberately rejected by stock Horizon.
+ pub const AURORA_WATER_API: &str = "0.1-aurora-water.1";
++/// Opt-in pre-translucent scene snapshot and composited material output.
++pub const AURORA_SCENE_API: &str = "0.1-aurora-water.2";
+ /// Full-screen passes a pack may chain.
+ pub const MAX_POST_PASSES: usize = 8;
+ /// Options a pack may declare.
+@@ -141,9 +143,9 @@ impl Manifest {
+                 raw.schema
+             )));
+         }
+-        if raw.api != API && raw.api != AURORA_WATER_API {
++        if raw.api != API && raw.api != AURORA_WATER_API && raw.api != AURORA_SCENE_API {
+             return Err(err(format!(
+-                "written for shader API {}; this Horizon serves {API} and {AURORA_WATER_API}",
++                "written for shader API {}; this Horizon serves {API}, {AURORA_WATER_API} and {AURORA_SCENE_API}",
+                 raw.api
+             )));
+         }
+diff --git a/crates/horizon-shader-api/src/stages.rs b/crates/horizon-shader-api/src/stages.rs
+index 1df33b2..b213f93 100644
+--- a/crates/horizon-shader-api/src/stages.rs
++++ b/crates/horizon-shader-api/src/stages.rs
+@@ -34,6 +34,19 @@ const FRAME: Resource = Resource {
+     doc: "The frame (`Frame`).",
+ };
+ 
++/// The local water.2 material extension. These images are valid only during
++/// translucent terrain; they exclude translucent terrain, particles and clouds.
++const SCENE_PRELUDE: &str = "
++@group(3) @binding(1) var pre_translucent_color: texture_2d<f32>;
++@group(3) @binding(2) var pre_translucent_depth: texture_depth_2d;
++@group(3) @binding(3) var scene_sampler: sampler;
++fn pre_translucent_depth_at(uv: vec2<f32>) -> f32 {
++    let size = vec2<f32>(textureDimensions(pre_translucent_depth));
++    let pixel = vec2<i32>(clamp(uv * size, vec2(0.0), size - 1.0));
++    return textureLoad(pre_translucent_depth, pixel, 0);
++}
++";
++
+ const POST_RESOURCES: [Resource; 6] = [
+     FRAME,
+     Resource {
+@@ -206,6 +219,25 @@ impl StageKind {
+         out
+     }
+ 
++    /// water.2 changes only the material stage. Existing API lines retain their ABI.
++    pub fn prelude_for(self, api: &str) -> String {
++        let mut out = self.prelude();
++        if self == StageKind::Material && api == crate::manifest::AURORA_SCENE_API {
++            out = out.replace(&SURFACE.wgsl(),
++                "// scene_composited skips engine fog; only for already composited scene colour.\nstruct Surface { color: vec4<f32>, scene_composited: bool, }\n");
++            out = out.replace(
++                &self.input().wgsl(),
++                &self.input().wgsl().replacen(
++                    "}\n",
++                    "    screen_uv: vec2<f32>,\n    fog: vec4<f32>,\n}\n",
++                    1,
++                ),
++            );
++            out += SCENE_PRELUDE;
++        }
++        out
++    }
++
+     /// The entry points put after the pack's files.
+     pub fn entries(self) -> &'static str {
+         match self {
+@@ -257,11 +289,21 @@ pub fn compose(pack: &Pack, kind: StageKind, file: &str) -> Composed {
+             .parts
+             .push((name.to_owned(), start..composed.text.len()));
+     };
+-    push("<prelude>", &kind.prelude());
++    push("<prelude>", &kind.prelude_for(&pack.manifest.api));
+     for shared in pack.manifest.shared.iter().filter(|s| *s != file) {
+         push(shared, pack.source(shared).unwrap_or_default());
+     }
+     push(file, pack.source(file).unwrap_or_default());
+-    push("<entries>", kind.entries());
++    let entries = if kind == StageKind::Material
++        && pack.manifest.api == crate::manifest::AURORA_SCENE_API
++    {
++        kind.entries().replace(
++            "in.is_water != 0u);",
++            "in.is_water != 0u, in.position.xy / frame.resolution, vec4(frame.fog_color, 0.0));",
++        )
++    } else {
++        kind.entries().to_owned()
++    };
++    push("<entries>", &entries);
+     composed
+ }
+diff --git a/crates/horizon-shader-api/tests/check.rs b/crates/horizon-shader-api/tests/check.rs
+index 4c6168a..7ca372f 100644
+--- a/crates/horizon-shader-api/tests/check.rs
++++ b/crates/horizon-shader-api/tests/check.rs
+@@ -144,3 +144,32 @@ fn texture_reads_have_a_budget() {
+         "texture reads; a stage may write 64",
+     );
+ }
++
++#[test]
++fn scene_material_inputs_are_opt_in_and_translate() {
++    let material = "fn material(i: MaterialInput) -> Surface {\n\
++        let c = textureSampleLevel(pre_translucent_color, scene_sampler, i.screen_uv, 0.0);\n\
++        let d = pre_translucent_depth_at(i.screen_uv);\n\
++        return Surface(vec4(c.rgb, d), true); }";
++    for api in ["0.1", "0.1-aurora-water.1", "0.1-aurora-water.2"] {
++        let manifest = format!(
++            "schema=1\nid=\"t\"\nname=\"Test\"\nversion=\"1\"\napi=\"{api}\"\n[material]\nfile=\"m.wgsl\"\n"
++        );
++        let files = [(MANIFEST, manifest.as_str()), ("m.wgsl", material)]
++            .map(|(k, v)| (k.into(), v.as_bytes().to_vec()))
++            .into();
++        let result = check(&Pack::from_files(files).unwrap());
++        if api.ends_with("water.2") {
++            assert!(result.unwrap().stages[0].scene_snapshot);
++        } else {
++            assert!(result.is_err(), "scene resources must require water.2");
++        }
++    }
++    assert!(
++        check(&sample())
++            .unwrap()
++            .stages
++            .iter()
++            .all(|s| !s.scene_snapshot)
++    );
++}
+diff --git a/crates/horizon-shader-api/tests/schema.rs b/crates/horizon-shader-api/tests/schema.rs
+index 0d83639..78f4bab 100644
+--- a/crates/horizon-shader-api/tests/schema.rs
++++ b/crates/horizon-shader-api/tests/schema.rs
+@@ -17,7 +17,8 @@ fn sample_text() -> String {
+ fn local_water_api_is_explicit_and_unknown_extensions_are_rejected() {
+     let local = sample_text().replace("api = \"0.1\"", "api = \"0.1-aurora-water.1\"");
+     assert_eq!(Manifest::parse(&local).unwrap().api, "0.1-aurora-water.1");
+-    assert!(Manifest::parse(&local.replace("water.1", "water.2")).is_err());
++    assert!(Manifest::parse(&local.replace("water.1", "water.2")).is_ok());
++    assert!(Manifest::parse(&local.replace("water.1", "water.3")).is_err());
+ }
+ 
+ fn refused(text: &str) -> String {
+diff --git a/docs/api/aurora-water.md b/docs/api/aurora-water.md
+new file mode 100644
+index 0000000..fd951b8
+--- /dev/null
++++ b/docs/api/aurora-water.md
+@@ -0,0 +1,58 @@
++# Local Aurora water extension (experimental fork)
++
++These API lines are deliberately incompatible with stock Horizon. They are local
++experiments on base `1f3ccb0fc3e593a6fe3a3c7da76d8e3d620e5b6d`, not an upstream
++compatibility promise. No code from other shader packs or renderers was used.
++
++`0.1-aurora-water.1` adds semantic `MaterialInput.is_water` via a spare terrain
++vertex bit, preserving the 24-byte vertex layout. The fluid mesher tags water
++(including waterlogged fluid), not glass, ice, lava or modelled cauldron water.
++This first extension also adds the field to the local 0.1 prelude: packs that
++construct MaterialInput themselves need adaptation.
++
++`0.1-aurora-water.2` opts a material stage into a separate pre-translucent scene
++capture. Other API lines do not allocate its targets or execute its pass. Its
++material prelude adds:
++
++- `MaterialInput.screen_uv`: fragment pixel centre divided by world resolution;
++  top-left origin. Actual raster coordinates, including jitter.
++- `MaterialInput.fog`: RGB native fog colour, alpha the exact fog mix factor at
++  the current surface, combining native spherical and cylindrical fog ranges.
++- Group 3 binding 1: `pre_translucent_color: texture_2d<f32>`.
++- Binding 2: `pre_translucent_depth: texture_depth_2d`, reversed, 0 for sky.
++- Binding 3: `scene_sampler`, linear/clamp-to-edge.
++- `pre_translucent_depth_at(uv)`: a clamped nearest depth load.
++- `Surface(color, scene_composited)`: false retains normal alpha test/blend/fog;
++  true skips native fog **only in the translucent fragment**. Use it for a fully
++  composited colour, normally alpha 1. Do not fog the captured background twice.
++
++The frame stays at binding 0. For a scene-enabled pack its projection matrices
++match the current world pass, including TAA jitter, bob and spin. The camera-
++relative world position follows from inverse projection, perspective divide,
++then inverse view with w=0.
++
++Snapshot resources are valid **only in translucent terrain**, after capture in
++this frame. Never read them in the solid material stage. No snapshot resources
++are added to sky/post. The additional constructors are opt-in to water.2; water.1
++and the previously extended 0.1 prelude do not change again.
++
++The renderer ends the world pass before translucent terrain, copies colour and
++Depth32Float through a fullscreen render pass into separate sampled attachments,
++then resumes the world with Load operations and rebound groups/index buffers.
++The material never samples its active render attachments. Source binding and
++snapshot targets are refreshed on resize or world-target replacement. Dropping
++the material releases the snapshot.
++
++This is not a pure opaque-only scene: earlier weather, items and effects are
++included. Transparent terrain, later particles and clouds are absent. It cannot
++resolve arbitrary transparent layers or reconstruct off-screen/occluded colour.
++At BGRA8 + Depth32Float the two images cost 8 bytes per world pixel, excluding
++alignment/driver overhead (28.1 MiB at 2560×1440). Measure total GPU frame time;
++this capture is not yet a separate item in the pack's pass-timing overlay.
++
++The renderer test `gfx::native_scene::tests::snapshot_is_independent_fresh_and_resized`
++checks real colour/depth pixels, source mutation after capture, a new frame and
++resize. It reports an explicit skip when no GPU is available; that is not GPU
++validation. Test the actual game with both sky/material stages (their group 3
++layouts differ), material-only/TAA, hot reload, resize and a previous API pack.
++Use disposable homes/worlds as required by AGENTS.md.
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,365 @@
+schema = 1
+id = "aurora_reflections"
+name = "Aurora Shaders — High (HDR)"
+version = "0.10.1-rc.1"
+api = "0.1-aurora-hdr.1"
+description = "Volumetric cloud banks, HDR lighting and water reflections. Local hdr.1 fork."
+authors = ["Aurora Shaders contributors"]
+shared = ["common.wgsl", "display.wgsl", "sky-effects.wgsl", "cloud-common.wgsl", "atmosphere.wgsl", "water.wgsl", "lighting.wgsl"]
+
+[atmosphere]
+custom_celestials = true
+custom_clouds = true
+
+[sun_shadows]
+quality = "high"
+
+[sky]
+file = "sky.wgsl"
+name = "Aurora sky"
+
+[material]
+file = "material.wgsl"
+name = "Aurora independent terrain lighting"
+
+[entity]
+file = "entity.wgsl"
+name = "Aurora model and hand lighting"
+
+# Native half-resolution cloud volume, temporal accumulation, full-resolution composition.
+[[post]]
+file = "post/cloud-volume.wgsl"
+name = "Cloud density (scaled resolution)"
+resolution_divisor = 2
+
+[[post]]
+file = "post/cloud-temporal.wgsl"
+name = "Cloud temporal resolve"
+resolution_divisor = 2
+history = true
+
+[[post]]
+file = "post/cloud-resolve.wgsl"
+name = "Cloud reconstruction"
+
+# Bloom reads the cloud composite; the next two operations are local to its pixel.
+[[post]]
+file = "post/finish.wgsl"
+name = "Glow, sunlight and underwater"
+
+# Keep the display transform separate: the final pass can run at the window size.
+[[post]]
+file = "post/grade.wgsl"
+name = "Aurora colour"
+
+[[options]]
+id = "sunset_strength"
+name = "Sunset warmth"
+type = "float"
+default = 0.85
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[options]]
+id = "glow_radius"
+name = "Glow radius"
+description = "Bloom spacing at 1080p; the smaller filter compensates its sample spacing."
+type = "float"
+default = 3.0
+min = 0.5
+max = 4.0
+step = 0.5
+
+[[options]]
+id = "glow_threshold"
+name = "Glow threshold"
+type = "float"
+default = 1.0
+min = 0.5
+max = 3.0
+step = 0.05
+
+[[options]]
+id = "glow_strength"
+name = "Glow strength"
+type = "float"
+default = 0.10
+min = 0.0
+max = 0.6
+step = 0.02
+
+[[options]]
+id = "colour_strength"
+name = "Colour strength"
+type = "float"
+default = 0.75
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[options]]
+id = "haze_strength"
+name = "Aerial haze"
+description = "Skylit terrain haze before engine fog; excludes unlit and translucent surfaces."
+type = "float"
+default = 0.15
+min = 0.0
+max = 0.6
+step = 0.05
+
+[[options]]
+id = "lighting_strength"
+name = "Surface lighting"
+type = "float"
+default = 1.0
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[options]]
+id = "night_lift"
+name = "Moonlit terrain visibility"
+type = "float"
+default = 0.85
+min = 0.0
+max = 1.0
+step = 0.05
+
+[budget]
+# A development target, not a measured performance guarantee.
+gpu_ms = 2.0
+
+[[options]]
+id = "water_strength"
+name = "Water surface"
+description = "Zero restores the engine water exactly; one enables Aurora water."
+type = "float"
+default = 1.0
+min = 0.0
+max = 1.0
+step = 0.1
+
+[[options]]
+id = "wave_strength"
+name = "Ripple slope"
+description = "Animated surface normals; does not displace geometry."
+type = "float"
+default = 0.65
+min = 0.0
+max = 1.5
+step = 0.05
+
+[[options]]
+id = "water_opacity"
+name = "Water tint opacity"
+description = "Opacity of distant fallback water; nearby water uses measured depth."
+type = "float"
+default = 0.42
+min = 0.2
+max = 0.8
+step = 0.02
+
+[[options]]
+id = "water_density"
+name = "Water absorption"
+description = "Absorption per block of visible water; larger values darken depth sooner."
+type = "float"
+default = 1.0
+min = 0.25
+max = 2.0
+step = 0.05
+
+[[options]]
+id = "refraction_strength"
+name = "Bottom distortion"
+description = "Small screen-space offset; guarded against foreground and screen edges."
+type = "float"
+default = 0.7
+min = 0.0
+max = 1.5
+step = 0.05
+
+[[options]]
+id = "depth_strength"
+name = "Depth water"
+description = "Zero selects the preceding surface-water model for comparison."
+type = "float"
+default = 1.0
+min = 0.0
+max = 1.0
+step = 0.1
+
+[[options]]
+id = "underwater_density"
+name = "Underwater haze"
+description = "Distance absorption while submerged; not the surface water density."
+type = "float"
+default = 1.0
+min = 0.5
+max = 2.0
+step = 0.05
+
+[[options]]
+id = "shadow_strength"
+name = "Sun shadow contrast"
+description = "Zero disables received shadows for A/B; the engine still renders the depth map."
+type = "float"
+default = 0.9
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[options]]
+id = "celestial_size"
+name = "Sun and moon size"
+type = "float"
+default = 1.0
+min = 0.5
+max = 2.0
+step = 0.1
+
+[[options]]
+id = "aurora_strength"
+name = "Northern lights"
+type = "float"
+default = 0.65
+min = 0.0
+max = 1.5
+step = 0.05
+
+[[options]]
+id = "cloud_coverage"
+name = "Cloud coverage"
+type = "float"
+default = 0.52
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[options]]
+id = "cloud_density"
+name = "Cloud density"
+type = "float"
+default = 0.85
+min = 0.0
+max = 1.5
+step = 0.05
+
+[[options]]
+id = "cloud_steps"
+name = "Cloud sampling budget"
+description = "Adaptive ray samples: half to three times this budget, with a minimum of four."
+type = "int"
+default = 16
+min = 8
+max = 64
+
+[[options]]
+id = "ray_strength"
+name = "Sun rays"
+type = "float"
+default = 0.20
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[options]]
+id = "ray_steps"
+name = "Sun ray steps"
+type = "int"
+default = 16
+min = 8
+max = 32
+
+[[options]]
+id = "cloud_history_strength"
+name = "Cloud temporal smoothing"
+description = "Zero disables accumulation; history never contains the terrain or HUD."
+type = "float"
+default = 0.9
+min = 0.0
+max = 0.95
+step = 0.05
+
+[[options]]
+id = "glow_filter_radius"
+name = "Bloom filter radius"
+description = "One uses 9 taps; two uses 25 taps. Weights stay normalized."
+type = "int"
+default = 2
+min = 1
+max = 2
+
+[[options]]
+id = "aurora_steps"
+name = "Northern lights quality"
+description = "Integration quality for folded curtains. Higher values reduce the ray step; brightness is normalized."
+type = "int"
+default = 10
+min = 4
+max = 16
+
+[[options]]
+id = "exposure"
+name = "Scene exposure"
+description = "One fixed exposure shared by world, water, sky and hand. No automatic adaptation."
+type = "float"
+default = 0.95
+min = 0.5
+max = 1.5
+step = 0.05
+
+[[options]]
+id = "contact_strength"
+name = "Contact ambient shading"
+type = "float"
+default = 0.7
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[options]]
+id = "contact_radius"
+name = "Contact shading radius"
+description = "World-space radius in blocks; only ambient sky and ground light are attenuated."
+type = "float"
+default = 2.4
+min = 0.5
+max = 3.0
+step = 0.1
+
+[[options]]
+id = "leaf_transmission"
+name = "Sunlight through leaves"
+type = "float"
+default = 0.65
+min = 0.0
+max = 1.0
+step = 0.05
+
+[[options]]
+id = "ssr_strength"
+name = "Water scene reflections"
+description = "Screen-space geometry reflections; misses fade to sky. Zero skips tracing."
+type = "float"
+default = 1.0
+min = 0.0
+max = 1.0
+step = 0.1
+
+[[options]]
+id = "ssr_steps"
+name = "Water reflection steps"
+type = "int"
+default = 48
+min = 24
+max = 48
+
+[[options]]
+id = "shadow_tent_radius"
+name = "Shadow filter radius"
+type = "int"
+default = 8
+min = 4
+max = 8

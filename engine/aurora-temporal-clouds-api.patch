@@ -1,0 +1,1206 @@
+diff --git a/crates/horizon-client-render/src/gfx.rs b/crates/horizon-client-render/src/gfx.rs
+index 87fee19..95e49b8 100644
+--- a/crates/horizon-client-render/src/gfx.rs
++++ b/crates/horizon-client-render/src/gfx.rs
+@@ -5332,13 +5332,14 @@ impl Renderer {
+             && let Some(post) = &mut native.post
+         {
+             let size = self.world_post.size().unwrap_or([1, 1]);
+-            post.run(
++            post.run_with_frame(
+                 &self.device,
+                 &mut encoder,
+                 (color, depth),
+                 &view_target,
+                 size,
+                 native.timing.as_mut(),
++                Some((&self.queue, &native.frame)),
+             );
+         } else if scaled.is_some() {
+             self.world_post
+diff --git a/crates/horizon-client-render/src/gfx/native_post.rs b/crates/horizon-client-render/src/gfx/native_post.rs
+index 9e4e0f2..240665c 100644
+--- a/crates/horizon-client-render/src/gfx/native_post.rs
++++ b/crates/horizon-client-render/src/gfx/native_post.rs
+@@ -4,13 +4,16 @@
+ //! colour and depth, the previous pass's output and two samplers. Passes before the last write
+ //! half-float targets of the world's size, so values over 1 carry to the next; the last draws
+ //! onto the screen. Every stage of a pack reads the same `frame`, written once a frame
+-//! (`NativeFrame`).
++//! (`NativeFrame`). atmosphere.2 opts into scaled targets and retained history in `temporal`.
+ 
+ use glam::{Mat4, Vec3};
+ use horizon_shader_api::{Frame as FrameInputs, check::CheckedStage, stages::GROUP};
+ 
+ use super::Frame;
+ 
++mod temporal;
++use temporal::TemporalPost;
++
+ const INTERMEDIATE: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+ 
+ /// The world's colour and depth views a set of bind groups was made for.
+@@ -18,6 +21,7 @@ type WorldViews = (wgpu::TextureView, wgpu::TextureView);
+ 
+ pub struct NativePost {
+     passes: Vec<(String, wgpu::RenderPipeline)>,
++    temporal: Option<TemporalPost>,
+     sun_shadow: Option<wgpu::BindGroup>,
+     layout: wgpu::BindGroupLayout,
+     frame: wgpu::Buffer,
+@@ -39,6 +43,7 @@ pub struct NativeFrame {
+     pub group: wgpu::BindGroup,
+     start: std::time::Instant,
+     frames: u32,
++    current: Option<FrameInputs>,
+ }
+ 
+ /// The uniform `frame` at binding 0, read by `visibility`.
+@@ -81,6 +86,7 @@ impl NativeFrame {
+             group,
+             start: std::time::Instant::now(),
+             frames: 0,
++            current: None,
+         }
+     }
+ 
+@@ -100,6 +106,7 @@ impl NativeFrame {
+             inputs.projection = projection.to_cols_array_2d();
+             inputs.projection_inverse = projection.inverse().to_cols_array_2d();
+         }
++        self.current = Some(inputs);
+         self.frames = self.frames.wrapping_add(1);
+         queue.write_buffer(&self.buffer, 0, bytemuck::bytes_of(&inputs));
+         queue.write_buffer(
+@@ -189,17 +196,25 @@ impl NativePost {
+         if needs_shadow && shadow.is_none() {
+             return Err("atmosphere post stages require the native sun shadow binding".into());
+         }
++        let temporal = stages
++            .iter()
++            .any(|s| s.temporal_api)
++            .then(|| TemporalPost::new(device, &stages));
+         let float = wgpu::TextureSampleType::Float { filterable: true };
++        let mut entries = vec![
++            frame_entry(wgpu::ShaderStages::FRAGMENT),
++            texture_entry(1, float),
++            texture_entry(2, wgpu::TextureSampleType::Depth),
++            texture_entry(3, float),
++            sampler_entry(4),
++            sampler_entry(5),
++        ];
++        if temporal.is_some() {
++            entries.extend(temporal::entries());
++        }
+         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+             label: Some("Native shader pack post"),
+-            entries: &[
+-                frame_entry(wgpu::ShaderStages::FRAGMENT),
+-                texture_entry(1, float),
+-                texture_entry(2, wgpu::TextureSampleType::Depth),
+-                texture_entry(3, float),
+-                sampler_entry(4),
+-                sampler_entry(5),
+-            ],
++            entries: &entries,
+         });
+         let mut groups: [Option<&wgpu::BindGroupLayout>; GROUP as usize + 1] = Default::default();
+         groups[GROUP as usize] = Some(&layout);
+@@ -262,6 +277,7 @@ impl NativePost {
+         };
+         Ok(Self {
+             passes,
++            temporal,
+             sun_shadow: shadow.map(|s| s.receiver.clone()),
+             layout,
+             frame: frame.buffer.clone(),
+@@ -364,7 +380,21 @@ impl NativePost {
+ 
+     /// Runs the passes over the world target `world` (colour, depth) of `size`, the last onto
+     /// `screen`, timed by `timing` when it times this frame.
++    #[cfg(test)]
+     pub fn run(
++        &mut self,
++        device: &wgpu::Device,
++        encoder: &mut wgpu::CommandEncoder,
++        world: (&wgpu::TextureView, &wgpu::TextureView),
++        screen: &wgpu::TextureView,
++        size: [u32; 2],
++        timing: Option<&mut super::pack_timing::PassTiming>,
++    ) {
++        self.run_with_frame(device, encoder, world, screen, size, timing, None);
++    }
++
++    /// The extended path needs the current exact camera for history reprojection.
++    pub fn run_with_frame(
+         &mut self,
+         device: &wgpu::Device,
+         encoder: &mut wgpu::CommandEncoder,
+@@ -372,7 +402,24 @@ impl NativePost {
+         screen: &wgpu::TextureView,
+         size: [u32; 2],
+         mut timing: Option<&mut super::pack_timing::PassTiming>,
++        context: Option<(&wgpu::Queue, &NativeFrame)>,
+     ) {
++        if let Some(mut temporal) = self.temporal.take() {
++            let (queue, frame) = context.expect("atmosphere.2 needs the current frame");
++            temporal.run(
++                self,
++                device,
++                queue,
++                encoder,
++                world,
++                screen,
++                size,
++                frame.current,
++                timing,
++            );
++            self.temporal = Some(temporal);
++            return;
++        }
+         self.prepare(device, world, size);
+         if let Some(t) = timing.as_deref_mut() {
+             t.mark(device, encoder, (world.0, self.format));
+diff --git a/crates/horizon-client-render/src/gfx/native_post/history_depth.wgsl b/crates/horizon-client-render/src/gfx/native_post/history_depth.wgsl
+new file mode 100644
+index 0000000..640d1b4
+--- /dev/null
++++ b/crates/horizon-client-render/src/gfx/native_post/history_depth.wgsl
+@@ -0,0 +1,10 @@
++@group(0) @binding(0) var scene: texture_depth_2d;
++struct Out { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, }
++@vertex fn vs(@builtin(vertex_index) i: u32) -> Out {
++    let p = vec2(f32((i << 1u) & 2u), f32(i & 2u));
++    return Out(vec4(p * 2.0 - 1.0, 0.0, 1.0), vec2(p.x, 1.0-p.y));
++}
++@fragment fn fs(i: Out) -> @location(0) f32 {
++    let size = vec2<f32>(textureDimensions(scene));
++    return textureLoad(scene, vec2<i32>(clamp(i.uv * size, vec2(0.0), size-1.0)), 0);
++}
+diff --git a/crates/horizon-client-render/src/gfx/native_post/temporal.rs b/crates/horizon-client-render/src/gfx/native_post/temporal.rs
+new file mode 100644
+index 0000000..c904257
+--- /dev/null
++++ b/crates/horizon-client-render/src/gfx/native_post/temporal.rs
+@@ -0,0 +1,429 @@
++//! atmosphere.2 only: scaled intermediates and one explicitly retained post result.
++use super::*;
++use std::collections::BTreeMap;
++
++#[repr(C)]
++#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
++struct HistoryUniform {
++    previous_view_projection: [[f32; 4]; 4],
++    camera_delta: [f32; 4],
++    clock: [f32; 4],
++}
++
++pub(super) fn entries() -> [wgpu::BindGroupLayoutEntry; 3] {
++    [
++        texture_entry(6, wgpu::TextureSampleType::Float { filterable: true }),
++        texture_entry(7, wgpu::TextureSampleType::Float { filterable: false }),
++        wgpu::BindGroupLayoutEntry {
++            binding: 8,
++            visibility: wgpu::ShaderStages::FRAGMENT,
++            ty: wgpu::BindingType::Buffer {
++                ty: wgpu::BufferBindingType::Uniform,
++                has_dynamic_offset: false,
++                min_binding_size: wgpu::BufferSize::new(size_of::<HistoryUniform>() as u64),
++            },
++            count: None,
++        },
++    ]
++}
++
++fn scaled(size: [u32; 2], divisor: u32) -> [u32; 2] {
++    size.map(|n| n.max(1).div_ceil(divisor))
++}
++
++/// Camera cuts, changed projection/environment and stale/nonconsecutive frames reject history.
++fn reusable(previous: &FrameInputs, current: &FrameInputs) -> bool {
++    let delta = Vec3::from(current.camera_position) - Vec3::from(previous.camera_position);
++    let forward =
++        |f: &FrameInputs| Mat4::from_cols_array_2d(&f.view_inverse).transform_vector3(-Vec3::Z);
++    let day_delta = (current.day_time - previous.day_time).abs();
++    let projection_delta = current
++        .projection
++        .iter()
++        .flatten()
++        .zip(previous.projection.iter().flatten())
++        .map(|(a, b)| (a - b).abs())
++        .fold(0.0_f32, f32::max);
++    current.frame_index == previous.frame_index.wrapping_add(1)
++        && current.dimension == previous.dimension
++        && current.eye_in == previous.eye_in
++        && delta.is_finite()
++        && delta.length_squared() < 64.0
++        && forward(previous).dot(forward(current)) > 0.8
++        && projection_delta < 0.02
++        && (current.time - previous.time).rem_euclid(3600.0) < 0.25
++        && day_delta.min(1.0 - day_delta) < 0.01
++        && (current.rain - previous.rain).abs() < 0.1
++        && (current.thunder - previous.thunder).abs() < 0.1
++}
++
++struct Resources {
++    size: [u32; 2],
++    world: WorldViews,
++    targets: BTreeMap<u32, [wgpu::Texture; 2]>,
++    views: BTreeMap<u32, [wgpu::TextureView; 2]>,
++    history: wgpu::Texture,
++    depth: wgpu::TextureView,
++    groups: Vec<wgpu::BindGroup>,
++    depth_group: wgpu::BindGroup,
++}
++
++pub(super) struct TemporalPost {
++    divisors: Vec<u32>,
++    history_index: Option<usize>,
++    uniform: wgpu::Buffer,
++    depth_layout: wgpu::BindGroupLayout,
++    depth_pipeline: wgpu::RenderPipeline,
++    resources: Option<Resources>,
++    previous: Option<FrameInputs>,
++}
++
++impl TemporalPost {
++    pub fn new(device: &wgpu::Device, stages: &[CheckedStage]) -> Self {
++        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
++            label: Some("Aurora post history camera"),
++            size: size_of::<HistoryUniform>() as u64,
++            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
++            mapped_at_creation: false,
++        });
++        let depth_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++            label: Some("Aurora history depth"),
++            entries: &[texture_entry(0, wgpu::TextureSampleType::Depth)],
++        });
++        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
++            label: Some("Aurora history depth"),
++            bind_group_layouts: &[Some(&depth_layout)],
++            ..Default::default()
++        });
++        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
++            label: Some("Aurora history depth snapshot"),
++            source: wgpu::ShaderSource::Wgsl(include_str!("history_depth.wgsl").into()),
++        });
++        let depth_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
++            label: Some("Aurora history depth snapshot"),
++            layout: Some(&layout),
++            vertex: wgpu::VertexState {
++                module: &module,
++                entry_point: Some("vs"),
++                buffers: &[],
++                compilation_options: Default::default(),
++            },
++            primitive: Default::default(),
++            depth_stencil: None,
++            multisample: Default::default(),
++            fragment: Some(wgpu::FragmentState {
++                module: &module,
++                entry_point: Some("fs"),
++                compilation_options: Default::default(),
++                targets: &[Some(wgpu::ColorTargetState {
++                    format: wgpu::TextureFormat::R32Float,
++                    blend: None,
++                    write_mask: wgpu::ColorWrites::ALL,
++                })],
++            }),
++            multiview_mask: None,
++            cache: None,
++        });
++        Self {
++            divisors: stages.iter().map(|s| s.resolution_divisor).collect(),
++            history_index: stages.iter().position(|s| s.history),
++            uniform,
++            depth_layout,
++            depth_pipeline,
++            resources: None,
++            previous: None,
++        }
++    }
++
++    fn prepare(
++        &mut self,
++        parent: &NativePost,
++        device: &wgpu::Device,
++        world: (&wgpu::TextureView, &wgpu::TextureView),
++        size: [u32; 2],
++    ) {
++        if self
++            .resources
++            .as_ref()
++            .is_some_and(|r| r.size == size && &r.world.0 == world.0 && &r.world.1 == world.1)
++        {
++            return;
++        }
++        let texture = |label, dimensions: [u32; 2], format, usage| {
++            device.create_texture(&wgpu::TextureDescriptor {
++                label: Some(label),
++                size: wgpu::Extent3d {
++                    width: dimensions[0],
++                    height: dimensions[1],
++                    depth_or_array_layers: 1,
++                },
++                mip_level_count: 1,
++                sample_count: 1,
++                dimension: wgpu::TextureDimension::D2,
++                format,
++                usage,
++                view_formats: &[],
++            })
++        };
++        let sampled = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT;
++        let mut targets = BTreeMap::new();
++        for divisor in self.divisors.iter().take(self.divisors.len() - 1) {
++            targets.entry(*divisor).or_insert_with(|| {
++                std::array::from_fn(|_| {
++                    texture(
++                        "Aurora scaled post",
++                        scaled(size, *divisor),
++                        INTERMEDIATE,
++                        sampled | wgpu::TextureUsages::COPY_SRC,
++                    )
++                })
++            });
++        }
++        let views: BTreeMap<_, _> = targets
++            .iter()
++            .map(|(k, t)| (*k, t.each_ref().map(|t| t.create_view(&Default::default()))))
++            .collect();
++        let history_size = self
++            .history_index
++            .map_or([1, 1], |i| scaled(size, self.divisors[i]));
++        let history = texture(
++            "Aurora previous cloud frame",
++            history_size,
++            INTERMEDIATE,
++            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
++        );
++        let history_view = history.create_view(&Default::default());
++        let depth = texture(
++            "Aurora previous scene depth",
++            history_size,
++            wgpu::TextureFormat::R32Float,
++            sampled,
++        )
++        .create_view(&Default::default());
++        let groups = (0..self.divisors.len())
++            .map(|i| {
++                let previous = if i == 0 {
++                    world.0
++                } else {
++                    &views[&self.divisors[i - 1]][(i - 1) % 2]
++                };
++                device.create_bind_group(&wgpu::BindGroupDescriptor {
++                    label: Some("Aurora temporal post resources"),
++                    layout: &parent.layout,
++                    entries: &[
++                        wgpu::BindGroupEntry {
++                            binding: 0,
++                            resource: parent.frame.as_entire_binding(),
++                        },
++                        wgpu::BindGroupEntry {
++                            binding: 1,
++                            resource: wgpu::BindingResource::TextureView(world.0),
++                        },
++                        wgpu::BindGroupEntry {
++                            binding: 2,
++                            resource: wgpu::BindingResource::TextureView(world.1),
++                        },
++                        wgpu::BindGroupEntry {
++                            binding: 3,
++                            resource: wgpu::BindingResource::TextureView(previous),
++                        },
++                        wgpu::BindGroupEntry {
++                            binding: 4,
++                            resource: wgpu::BindingResource::Sampler(&parent.linear),
++                        },
++                        wgpu::BindGroupEntry {
++                            binding: 5,
++                            resource: wgpu::BindingResource::Sampler(&parent.nearest),
++                        },
++                        wgpu::BindGroupEntry {
++                            binding: 6,
++                            resource: wgpu::BindingResource::TextureView(&history_view),
++                        },
++                        wgpu::BindGroupEntry {
++                            binding: 7,
++                            resource: wgpu::BindingResource::TextureView(&depth),
++                        },
++                        wgpu::BindGroupEntry {
++                            binding: 8,
++                            resource: self.uniform.as_entire_binding(),
++                        },
++                    ],
++                })
++            })
++            .collect();
++        let depth_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
++            label: Some("Aurora history scene depth"),
++            layout: &self.depth_layout,
++            entries: &[wgpu::BindGroupEntry {
++                binding: 0,
++                resource: wgpu::BindingResource::TextureView(world.1),
++            }],
++        });
++        self.resources = Some(Resources {
++            size,
++            world: (world.0.clone(), world.1.clone()),
++            targets,
++            views,
++            history,
++            depth,
++            groups,
++            depth_group,
++        });
++        self.previous = None;
++    }
++
++    pub fn run(
++        &mut self,
++        parent: &NativePost,
++        device: &wgpu::Device,
++        queue: &wgpu::Queue,
++        encoder: &mut wgpu::CommandEncoder,
++        world: (&wgpu::TextureView, &wgpu::TextureView),
++        screen: &wgpu::TextureView,
++        size: [u32; 2],
++        current: Option<FrameInputs>,
++        mut timing: Option<&mut super::super::pack_timing::PassTiming>,
++    ) {
++        self.prepare(parent, device, world, size);
++        let current = current.unwrap_or_default();
++        let valid = self.history_index.is_some()
++            && self
++                .previous
++                .as_ref()
++                .is_some_and(|p| reusable(p, &current));
++        let previous = self.previous.unwrap_or(current);
++        let vp = Mat4::from_cols_array_2d(&previous.projection)
++            * Mat4::from_cols_array_2d(&previous.view);
++        let delta = Vec3::from(current.camera_position) - Vec3::from(previous.camera_position);
++        queue.write_buffer(
++            &self.uniform,
++            0,
++            bytemuck::bytes_of(&HistoryUniform {
++                previous_view_projection: vp.to_cols_array_2d(),
++                camera_delta: [delta.x, delta.y, delta.z, f32::from(u8::from(valid))],
++                clock: [previous.time, current.time, 0.0, 0.0],
++            }),
++        );
++        if let Some(t) = timing.as_deref_mut() {
++            t.mark(device, encoder, (world.0, parent.format));
++        }
++        let r = self.resources.as_ref().unwrap();
++        for (i, (label, pipeline)) in parent.passes.iter().enumerate() {
++            let view = if i + 1 == parent.passes.len() {
++                screen
++            } else {
++                &r.views[&self.divisors[i]][i % 2]
++            };
++            {
++                let attachments = [Some(wgpu::RenderPassColorAttachment {
++                    view,
++                    resolve_target: None,
++                    depth_slice: None,
++                    ops: wgpu::Operations {
++                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
++                        store: wgpu::StoreOp::Store,
++                    },
++                })];
++                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
++                    label: Some(label),
++                    color_attachments: &attachments,
++                    timestamp_writes: timing.as_deref_mut().and_then(|t| t.writes(label)),
++                    ..Default::default()
++                });
++                pass.set_pipeline(pipeline);
++                if let Some(shadow) = &parent.sun_shadow {
++                    pass.set_bind_group(2, shadow, &[]);
++                }
++                pass.set_bind_group(GROUP, &r.groups[i], &[]);
++                pass.draw(0..3, 0..1);
++            }
++            if self.history_index == Some(i) {
++                let source = &r.targets[&self.divisors[i]][i % 2];
++                encoder.copy_texture_to_texture(
++                    source.as_image_copy(),
++                    r.history.as_image_copy(),
++                    source.size(),
++                );
++            }
++        }
++        if self.history_index.is_some() {
++            // Store depth after every consumer has finished reading the previous frame.
++            let attachments = [Some(wgpu::RenderPassColorAttachment {
++                view: &r.depth,
++                resolve_target: None,
++                depth_slice: None,
++                ops: wgpu::Operations {
++                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
++                    store: wgpu::StoreOp::Store,
++                },
++            })];
++            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
++                label: Some("Aurora history depth snapshot"),
++                color_attachments: &attachments,
++                ..Default::default()
++            });
++            pass.set_pipeline(&self.depth_pipeline);
++            pass.set_bind_group(0, &r.depth_group, &[]);
++            pass.draw(0..3, 0..1);
++        }
++        self.previous = Some(current);
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    fn input(index: u32) -> FrameInputs {
++        FrameInputs {
++            frame_index: index,
++            projection: Mat4::IDENTITY.to_cols_array_2d(),
++            view_inverse: Mat4::IDENTITY.to_cols_array_2d(),
++            ..Default::default()
++        }
++    }
++    #[test]
++    fn history_accepts_motion_but_rejects_cuts_and_environment_changes() {
++        let p = input(0);
++        let mut c = input(1);
++        c.camera_position = [0.2, 0.0, 0.0];
++        c.time = 0.016;
++        assert!(reusable(&p, &c));
++        c.camera_position[0] = 8.0;
++        assert!(!reusable(&p, &c));
++        c.camera_position[0] = 0.0;
++        c.dimension = 1;
++        assert!(!reusable(&p, &c));
++        c.dimension = 0;
++        c.eye_in = 1;
++        assert!(!reusable(&p, &c));
++        c.eye_in = 0;
++        c.projection[0][0] += 0.1;
++        assert!(!reusable(&p, &c));
++        c.projection[0][0] -= 0.1;
++        c.view_inverse = Mat4::from_rotation_y(1.0).to_cols_array_2d();
++        assert!(!reusable(&p, &c));
++        c.view_inverse = p.view_inverse;
++        c.day_time = 0.25;
++        assert!(!reusable(&p, &c));
++        c.day_time = 0.0;
++        c.time = 1.0;
++        assert!(!reusable(&p, &c));
++        c.time = 0.016;
++        c.frame_index = 3;
++        assert!(!reusable(&p, &c));
++    }
++    #[test]
++    fn odd_sizes_and_clock_wrap_are_supported() {
++        assert_eq!(scaled([5, 3], 2), [3, 2]);
++        assert_eq!(scaled([1, 1], 4), [1, 1]);
++        let mut p = input(u32::MAX);
++        p.time = 3599.99;
++        p.day_time = 0.9999;
++        assert!(reusable(&p, &input(0)));
++        assert_eq!(size_of::<HistoryUniform>(), 96);
++    }
++}
++
++#[cfg(test)]
++#[path = "temporal_gpu.rs"]
++mod gpu_tests;
+diff --git a/crates/horizon-client-render/src/gfx/native_post/temporal_gpu.rs b/crates/horizon-client-render/src/gfx/native_post/temporal_gpu.rs
+new file mode 100644
+index 0000000..dac0cdd
+--- /dev/null
++++ b/crates/horizon-client-render/src/gfx/native_post/temporal_gpu.rs
+@@ -0,0 +1,171 @@
++use super::*;
++use horizon_shader_api::{MANIFEST, Pack, StageKind, check};
++
++#[test]
++fn scaled_history_on_gpu() {
++    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
++    let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
++        assert!(
++            std::env::var_os("AURORA_REQUIRE_GPU").is_none(),
++            "Metal adapter required for cloud history test"
++        );
++        eprintln!("SKIP temporal GPU test: no adapter");
++        return;
++    };
++    eprintln!("Temporal GPU: {:?}", adapter.get_info());
++    let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
++    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
++    let format = wgpu::TextureFormat::Rgba8Unorm;
++    let mut frame = NativeFrame::new(&device);
++    let make_post = |frame: &NativeFrame| {
++        let manifest = "schema=1\nid=\"t\"\nname=\"T\"\nversion=\"1\"\napi=\"0.1-aurora-atmosphere.2\"\n[sun_shadows]\nquality=\"low\"\n[material]\nfile=\"m.wgsl\"\n[[post]]\nfile=\"a.wgsl\"\nresolution_divisor=2\n[[post]]\nfile=\"h.wgsl\"\nresolution_divisor=2\nhistory=true\n[[post]]\nfile=\"p.wgsl\"\n";
++        let files=[(MANIFEST,manifest),
++            ("m.wgsl","fn material(i:MaterialInput)->Surface{return Surface(i.albedo,false);}"),
++            ("a.wgsl","fn post(i:PostInput)->vec4<f32>{return vec4(0.4*f32(frame.frame_index+1u),0.0,0.0,1.0);}"),
++            ("h.wgsl","fn post(i:PostInput)->vec4<f32>{if post_history.camera_delta.w<0.5{return i.color;} let h=textureSampleLevel(history_color,linear_sampler,i.uv,0.0);return vec4((i.color.r+h.r)*0.5,1.0,history_depth_at(i.uv),1.0);}"),
++            ("p.wgsl","fn post(i:PostInput)->vec4<f32>{return vec4(i.color.r*0.5,i.color.gb,1.0);}")]
++            .map(|(k,v)|(k.into(),v.as_bytes().to_vec())).into();
++        // Isolate temporal resources. These shaders do not use shadows; the separate
++        // NativeShadow GPU tests exercise the actual group-2 receiver on both APIs.
++        let stages = check(&Pack::from_files(files).unwrap())
++            .unwrap()
++            .stages
++            .into_iter()
++            .filter(|s| s.kind == StageKind::Post)
++            .map(|mut s| {
++                s.sun_shadow = false;
++                s
++            })
++            .collect();
++        NativePost::new(&device, stages, &[], format, frame).unwrap()
++    };
++    let mut post = make_post(&frame);
++    let texture = |format, size: [u32; 2], usage| {
++        device.create_texture(&wgpu::TextureDescriptor {
++            label: None,
++            size: wgpu::Extent3d {
++                width: size[0],
++                height: size[1],
++                depth_or_array_layers: 1,
++            },
++            mip_level_count: 1,
++            sample_count: 1,
++            dimension: wgpu::TextureDimension::D2,
++            format,
++            usage,
++            view_formats: &[],
++        })
++    };
++    let sampled = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
++    let mut size = [5, 3];
++    let mut color = texture(format, size, sampled).create_view(&Default::default());
++    let mut depth =
++        texture(wgpu::TextureFormat::Depth32Float, size, sampled).create_view(&Default::default());
++    for (i, want) in [
++        [51, 0, 0],
++        [77, 255, 64],
++        [153, 0, 0],
++        [204, 0, 0],
++        [255, 0, 0],
++    ]
++    .into_iter()
++    .enumerate()
++    {
++        if i == 3 {
++            // Resize to another odd size: resources and history must be replaced.
++            size = [7, 5];
++            color = texture(format, size, sampled).create_view(&Default::default());
++            depth = texture(wgpu::TextureFormat::Depth32Float, size, sampled)
++                .create_view(&Default::default());
++        }
++        if i == 4 {
++            post = make_post(&frame);
++        } // Pack reload starts with no history.
++        let input = FrameInputs {
++            frame_index: i as u32,
++            time: i as f32 * 0.016,
++            camera_position: if i >= 2 { [20.0, 0.0, 0.0] } else { [0.0; 3] },
++            resolution: size.map(|v| v as f32),
++            projection: Mat4::IDENTITY.to_cols_array_2d(),
++            view: Mat4::IDENTITY.to_cols_array_2d(),
++            view_inverse: Mat4::IDENTITY.to_cols_array_2d(),
++            ..Default::default()
++        };
++        frame.current = Some(input);
++        queue.write_buffer(&frame.buffer, 0, bytemuck::bytes_of(&input));
++        let screen = texture(
++            format,
++            size,
++            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
++        );
++        let screen_view = screen.create_view(&Default::default());
++        let mut encoder = device.create_command_encoder(&Default::default());
++        {
++            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
++                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
++                    view: &color,
++                    resolve_target: None,
++                    depth_slice: None,
++                    ops: wgpu::Operations {
++                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
++                        store: wgpu::StoreOp::Store,
++                    },
++                })],
++                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
++                    view: &depth,
++                    depth_ops: Some(wgpu::Operations {
++                        load: wgpu::LoadOp::Clear(if i == 0 { 0.25 } else { 0.75 }),
++                        store: wgpu::StoreOp::Store,
++                    }),
++                    stencil_ops: None,
++                }),
++                ..Default::default()
++            });
++        }
++        post.run_with_frame(
++            &device,
++            &mut encoder,
++            (&color, &depth),
++            &screen_view,
++            size,
++            None,
++            Some((&queue, &frame)),
++        );
++        let r = post.temporal.as_ref().unwrap().resources.as_ref().unwrap();
++        assert_eq!([r.history.width(), r.history.height()], scaled(size, 2));
++        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
++            label: None,
++            size: 256 * u64::from(size[1]),
++            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
++            mapped_at_creation: false,
++        });
++        encoder.copy_texture_to_buffer(
++            screen.as_image_copy(),
++            wgpu::TexelCopyBufferInfo {
++                buffer: &buffer,
++                layout: wgpu::TexelCopyBufferLayout {
++                    offset: 0,
++                    bytes_per_row: Some(256),
++                    rows_per_image: Some(size[1]),
++                },
++            },
++            screen.size(),
++        );
++        queue.submit([encoder.finish()]);
++        buffer
++            .slice(..)
++            .map_async(wgpu::MapMode::Read, |r| r.unwrap());
++        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
++        let bytes = buffer.slice(..).get_mapped_range().unwrap();
++        for y in 0..size[1] {
++            for x in 0..size[0] {
++                let p = &bytes[(y * 256 + x * 4) as usize..][..4];
++                assert!(
++                    p[..3].iter().zip(want).all(|(a, b)| a.abs_diff(b) <= 1),
++                    "frame {i}, pixel {x},{y}: {p:?}, expected {want:?}"
++                );
++            }
++        }
++    }
++    assert!(pollster::block_on(scope.pop()).is_none());
++}
+diff --git a/crates/horizon-client-render/src/gfx/native_shadow_tests.rs b/crates/horizon-client-render/src/gfx/native_shadow_tests.rs
+index fb32a39..771c2fb 100644
+--- a/crates/horizon-client-render/src/gfx/native_shadow_tests.rs
++++ b/crates/horizon-client-render/src/gfx/native_shadow_tests.rs
+@@ -5,7 +5,7 @@ use wgpu::util::DeviceExt;
+ 
+ #[test]
+ fn cutout_caster_and_receiver_on_gpu() {
+-    run_receiver_test(None, false);
++    run_receiver_test(None, 0);
+ }
+ 
+ #[test]
+@@ -16,18 +16,25 @@ fn quality_levels_on_gpu() {
+         SunShadowQuality::High,
+         SunShadowQuality::Ultra,
+     ] {
+-        run_receiver_test(Some(quality), false);
++        run_receiver_test(Some(quality), 0);
+     }
+ }
+ 
+ #[test]
+ fn atmosphere_post_on_gpu() {
+     for quality in [SunShadowQuality::Low, SunShadowQuality::High] {
+-        run_receiver_test(Some(quality), true);
++        run_receiver_test(Some(quality), 1);
+     }
+ }
+ 
+-fn run_receiver_test(recipe: Option<SunShadowQuality>, atmosphere: bool) {
++#[test]
++fn atmosphere_temporal_post_on_gpu() {
++    for quality in [SunShadowQuality::Low, SunShadowQuality::High] {
++        run_receiver_test(Some(quality), 2);
++    }
++}
++
++fn run_receiver_test(recipe: Option<SunShadowQuality>, atmosphere: u8) {
+     let quality = recipe.unwrap_or_default();
+     eprintln!("Sunlight recipe: {recipe:?}");
+     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+@@ -179,10 +186,11 @@ fn run_receiver_test(recipe: Option<SunShadowQuality>, atmosphere: bool) {
+         400,
+         bytemuck::cast_slice(&[0.25_f32, 1.0, 0.0, 0.0, 7.0, 0.0, 0.0, 0.0]),
+     );
+-    let mut post = if atmosphere {
++    let mut post = if atmosphere > 0 {
+         use horizon_shader_api::{MANIFEST, Pack, StageKind, check};
+         let manifest = format!(
+-            "schema=1\nid=\"t\"\nname=\"T\"\nversion=\"1\"\napi=\"0.1-aurora-atmosphere.1\"\n[sun_shadows]\nquality=\"{}\"\n[material]\nfile=\"m.wgsl\"\n[[post]]\nfile=\"p.wgsl\"\n",
++            "schema=1\nid=\"t\"\nname=\"T\"\nversion=\"1\"\napi=\"0.1-aurora-atmosphere.{}\"\n[sun_shadows]\nquality=\"{}\"\n[material]\nfile=\"m.wgsl\"\n[[post]]\nfile=\"p.wgsl\"\n",
++            atmosphere,
+             if quality == SunShadowQuality::Low {
+                 "low"
+             } else {
+@@ -348,13 +356,14 @@ fn run_receiver_test(recipe: Option<SunShadowQuality>, atmosphere: bool) {
+                     ..Default::default()
+                 });
+             }
+-            post.run(
++            post.run_with_frame(
+                 &device,
+                 &mut encoder,
+                 (&world_color, &world_depth),
+                 &target_view,
+                 [4, 1],
+                 None,
++                Some((&queue, &frame)),
+             );
+         } else {
+             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+@@ -407,7 +416,7 @@ fn run_receiver_test(recipe: Option<SunShadowQuality>, atmosphere: bool) {
+         recv.recv().unwrap().unwrap();
+         let bytes = read.slice(..).get_mapped_range().unwrap();
+         for i in 0..4 {
+-            if atmosphere {
++            if atmosphere > 0 {
+                 assert_eq!(bytes[i * 4 + 1], 255, "lunar phase extension");
+                 assert!(
+                     (i32::from(bytes[i * 4 + 2]) - 64).abs() <= 1,
+diff --git a/crates/horizon-shader-api/src/check.rs b/crates/horizon-shader-api/src/check.rs
+index 729ffce..73e55e6 100644
+--- a/crates/horizon-shader-api/src/check.rs
++++ b/crates/horizon-shader-api/src/check.rs
+@@ -55,6 +55,9 @@ fn problem(file: &str, message: impl Into<String>) -> Problem {
+ #[derive(Debug)]
+ pub struct CheckedStage {
+     pub kind: StageKind,
++    pub temporal_api: bool,
++    pub resolution_divisor: u32,
++    pub history: bool,
+     /// The opt-in water.2 material stage needs a pre-translucent scene snapshot.
+     pub scene_snapshot: bool,
+     pub sun_shadow: bool,
+@@ -94,6 +97,8 @@ pub fn check(pack: &Pack) -> Result<Report, Vec<Problem>> {
+         match check_stage(pack, kind, &stage.file) {
+             Ok(mut c) => {
+                 c.label = stage.name.clone().unwrap_or_else(|| stage.file.clone());
++                c.resolution_divisor = stage.resolution_divisor.unwrap_or(1);
++                c.history = stage.history.unwrap_or(false);
+                 checked.push(c);
+             }
+             Err(p) => problems.extend(p),
+@@ -177,15 +182,17 @@ pub fn check_stage(pack: &Pack, kind: StageKind, file: &str) -> Result<CheckedSt
+     if !problems.is_empty() {
+         return Err(problems);
+     }
++    let post = pack.manifest.post.iter().find(|s| s.file == file);
+     Ok(CheckedStage {
+         kind,
++        temporal_api: pack.manifest.api == crate::manifest::AURORA_TEMPORAL_API,
++        resolution_divisor: post.and_then(|s| s.resolution_divisor).unwrap_or(1),
++        history: post.and_then(|s| s.history).unwrap_or(false),
+         sun_shadow: (kind == StageKind::Material
+             && crate::manifest::has_sun_shadow(&pack.manifest.api))
+-            || (kind == StageKind::Post
+-                && pack.manifest.api == crate::manifest::AURORA_ATMOSPHERE_API),
++            || (kind == StageKind::Post && crate::manifest::has_atmosphere(&pack.manifest.api)),
+         sun_shadow_quality: if kind == StageKind::Material
+-            || (kind == StageKind::Post
+-                && pack.manifest.api == crate::manifest::AURORA_ATMOSPHERE_API)
++            || (kind == StageKind::Post && crate::manifest::has_atmosphere(&pack.manifest.api))
+         {
+             pack.manifest.sun_shadows.map(|s| s.quality)
+         } else {
+diff --git a/crates/horizon-shader-api/src/manifest.rs b/crates/horizon-shader-api/src/manifest.rs
+index 097f789..c1c188e 100644
+--- a/crates/horizon-shader-api/src/manifest.rs
++++ b/crates/horizon-shader-api/src/manifest.rs
+@@ -20,10 +20,15 @@ pub const AURORA_SHADOW_API: &str = "0.1-aurora-shadow.1";
+ pub const AURORA_SHADOW_QUALITY_API: &str = "0.1-aurora-shadow.2";
+ /// Local sky ownership, lunar phase and shadow sampling in post stages.
+ pub const AURORA_ATMOSPHERE_API: &str = "0.1-aurora-atmosphere.1";
++/// Scaled post passes and an opt-in cloud history; older APIs retain their ABI.
++pub const AURORA_TEMPORAL_API: &str = "0.1-aurora-atmosphere.2";
++pub fn has_atmosphere(api: &str) -> bool {
++    matches!(api, AURORA_ATMOSPHERE_API | AURORA_TEMPORAL_API)
++}
+ pub fn has_sun_shadow(api: &str) -> bool {
+     matches!(
+         api,
+-        AURORA_SHADOW_API | AURORA_SHADOW_QUALITY_API | AURORA_ATMOSPHERE_API
++        AURORA_SHADOW_API | AURORA_SHADOW_QUALITY_API | AURORA_ATMOSPHERE_API | AURORA_TEMPORAL_API
+     )
+ }
+ pub fn has_water_environment(api: &str) -> bool {
+@@ -136,6 +141,10 @@ pub struct Stage {
+     /// Shown in the GPU time overlay; the file name when absent.
+     #[serde(default)]
+     pub name: Option<String>,
++    /// atmosphere.2 post only: 1 (full), 2 (half), or 4 (quarter per axis).
++    pub resolution_divisor: Option<u32>,
++    /// atmosphere.2 post only: retain this pass for the next rendered frame.
++    pub history: Option<bool>,
+ }
+ 
+ /// An option the player can change: a WGSL `override` constant of the
+@@ -239,9 +248,10 @@ impl Manifest {
+             && raw.api != AURORA_SHADOW_API
+             && raw.api != AURORA_SHADOW_QUALITY_API
+             && raw.api != AURORA_ATMOSPHERE_API
++            && raw.api != AURORA_TEMPORAL_API
+         {
+             return Err(err(format!(
+-                "written for shader API {}; this Horizon serves {API}, {AURORA_WATER_API}, {AURORA_SCENE_API}, {AURORA_IMMERSION_API}, {AURORA_SHADOW_API}, {AURORA_SHADOW_QUALITY_API} and {AURORA_ATMOSPHERE_API}",
++                "written for shader API {}; this Horizon serves {API}, {AURORA_WATER_API}, {AURORA_SCENE_API}, {AURORA_IMMERSION_API}, {AURORA_SHADOW_API}, {AURORA_SHADOW_QUALITY_API}, {AURORA_ATMOSPHERE_API} and {AURORA_TEMPORAL_API}",
+                 raw.api
+             )));
+         }
+@@ -268,29 +278,53 @@ impl Manifest {
+         }
+         if matches!(
+             raw.api.as_str(),
+-            AURORA_SHADOW_QUALITY_API | AURORA_ATMOSPHERE_API
++            AURORA_SHADOW_QUALITY_API | AURORA_ATMOSPHERE_API | AURORA_TEMPORAL_API
+         ) {
+             if raw.sun_shadows.is_none() || raw.material.is_none() {
+                 return Err(err(
+-                    "shadow.2 / atmosphere.1 requires [sun_shadows] quality and a [material] stage"
++                    "shadow.2 / atmosphere requires [sun_shadows] quality and a [material] stage"
+                         .into(),
+                 ));
+             }
+         } else if raw.sun_shadows.is_some() {
+             return Err(err(
+-                "[sun_shadows] requires API 0.1-aurora-shadow.2 or 0.1-aurora-atmosphere.1".into(),
++                "[sun_shadows] requires API 0.1-aurora-shadow.2 or an Aurora atmosphere API".into(),
+             ));
+         }
+         if let Some(atmosphere) = raw.atmosphere {
+-            if raw.api != AURORA_ATMOSPHERE_API {
+-                return Err(err(
+-                    "[atmosphere] requires API 0.1-aurora-atmosphere.1".into()
+-                ));
++            if !has_atmosphere(&raw.api) {
++                return Err(err("[atmosphere] requires an Aurora atmosphere API".into()));
+             }
+             if atmosphere.custom_celestials && raw.sky.is_none() {
+                 return Err(err("custom_celestials requires a [sky] stage".into()));
+             }
+         }
++        for stage in raw.sky.iter().chain(&raw.material) {
++            if stage.resolution_divisor.is_some() || stage.history.is_some() {
++                return Err(err("resolution_divisor and history are post-only".into()));
++            }
++        }
++        let mut histories = 0;
++        for (index, stage) in raw.post.iter().enumerate() {
++            if raw.api != AURORA_TEMPORAL_API
++                && (stage.resolution_divisor.is_some() || stage.history.is_some())
++            {
++                return Err(err("scaled passes and history require atmosphere.2".into()));
++            }
++            let divisor = stage.resolution_divisor.unwrap_or(1);
++            if !matches!(divisor, 1 | 2 | 4) {
++                return Err(err("resolution_divisor must be 1, 2 or 4".into()));
++            }
++            if index + 1 == raw.post.len() && (divisor != 1 || stage.history == Some(true)) {
++                return Err(err(
++                    "the final post pass must be full resolution without history".into(),
++                ));
++            }
++            histories += usize::from(stage.history == Some(true));
++        }
++        if histories > 1 {
++            return Err(err("atmosphere.2 supports one history pass".into()));
++        }
+         if raw.post.len() > MAX_POST_PASSES {
+             return Err(err(format!(
+                 "{} post passes; a pack may chain {MAX_POST_PASSES}",
+diff --git a/crates/horizon-shader-api/src/post_history.wgsl b/crates/horizon-shader-api/src/post_history.wgsl
+new file mode 100644
+index 0000000..4a5dde1
+--- /dev/null
++++ b/crates/horizon-shader-api/src/post_history.wgsl
+@@ -0,0 +1,15 @@
++// atmosphere.2 post history. Only the stage marked history=true may consume it.
++struct PostHistoryFrame {
++    previous_view_projection: mat4x4<f32>,
++    // xyz: current camera minus previous camera; w: 1 only for reusable history.
++    camera_delta: vec4<f32>,
++    // x: previous wrapped seconds, y: current wrapped seconds; z/w reserved.
++    clock: vec4<f32>,
++}
++@group(3) @binding(6) var history_color: texture_2d<f32>;
++@group(3) @binding(7) var history_depth: texture_2d<f32>;
++@group(3) @binding(8) var<uniform> post_history: PostHistoryFrame;
++fn history_depth_at(uv: vec2<f32>) -> f32 {
++    let size = vec2<f32>(textureDimensions(history_depth));
++    return textureLoad(history_depth, vec2<i32>(clamp(uv * size, vec2(0.0), size - 1.0)), 0).r;
++}
+diff --git a/crates/horizon-shader-api/src/stages.rs b/crates/horizon-shader-api/src/stages.rs
+index 1766f22..fa4600f 100644
+--- a/crates/horizon-shader-api/src/stages.rs
++++ b/crates/horizon-shader-api/src/stages.rs
+@@ -236,7 +236,7 @@ impl StageKind {
+             out = out.replace(&frame, &frame.replacen("}\n",
+                 "    // x: continuous water coverage, y: water environment enabled; z/w reserved.\n    water: vec4<f32>,\n}\n", 1));
+         }
+-        if api == crate::manifest::AURORA_ATMOSPHERE_API {
++        if crate::manifest::has_atmosphere(api) {
+             out = out.replace("    water: vec4<f32>,", "    water: vec4<f32>,\n    // x: moon phase 0..7 (0 full); y/z/w reserved.\n    atmosphere: vec4<f32>,");
+         }
+         if self == StageKind::Material && crate::manifest::has_scene_snapshot(api) {
+@@ -256,7 +256,7 @@ impl StageKind {
+             out += include_str!("sun_shadow.wgsl");
+         }
+         if (self == StageKind::Material && api == crate::manifest::AURORA_SHADOW_QUALITY_API)
+-            || (self != StageKind::Sky && api == crate::manifest::AURORA_ATMOSPHERE_API)
++            || (self != StageKind::Sky && crate::manifest::has_atmosphere(api))
+         {
+             let radius = quality.pcf_radius();
+             out += &format!(
+@@ -269,6 +269,9 @@ impl StageKind {
+                 out += include_str!("sun_volume.wgsl");
+             }
+         }
++        if self == StageKind::Post && api == crate::manifest::AURORA_TEMPORAL_API {
++            out += include_str!("post_history.wgsl");
++        }
+         out
+     }
+ 
+diff --git a/crates/horizon-shader-api/tests/check.rs b/crates/horizon-shader-api/tests/check.rs
+index 40b9894..af4389e 100644
+--- a/crates/horizon-shader-api/tests/check.rs
++++ b/crates/horizon-shader-api/tests/check.rs
+@@ -285,3 +285,26 @@ fn atmosphere_ownership_and_post_shadow_are_explicit() {
+         .is_err()
+     );
+ }
++
++#[test]
++fn temporal_history_translates_and_legacy_has_no_history_bindings() {
++    let manifest = "schema=1\nid=\"t\"\nname=\"T\"\nversion=\"1\"\napi=\"0.1-aurora-atmosphere.2\"\n[sun_shadows]\nquality=\"high\"\n[material]\nfile=\"m.wgsl\"\n[[post]]\nfile=\"h.wgsl\"\nresolution_divisor=2\nhistory=true\n[[post]]\nfile=\"p.wgsl\"\n";
++    let files = [(MANIFEST,manifest),
++        ("m.wgsl","fn material(i:MaterialInput)->Surface{return Surface(i.albedo,false);}"),
++        ("h.wgsl","fn post(i:PostInput)->vec4<f32>{let p=post_history.previous_view_projection * vec4(post_history.camera_delta.xyz,1.0); return textureSampleLevel(history_color,linear_sampler,i.uv,0.0) + vec4(history_depth_at(i.uv)+p.x+post_history.clock.x);}"),
++        ("p.wgsl","fn post(i:PostInput)->vec4<f32>{return i.color;}")]
++        .map(|(k,v)|(k.into(),v.as_bytes().to_vec())).into();
++    let pack = Pack::from_files(files).unwrap();
++    let report = check(&pack).unwrap();
++    assert!(report.stages[1].temporal_api && report.stages[1].history);
++    assert_eq!(report.stages[1].resolution_divisor, 2);
++    let mut old = pack.files;
++    old.insert(
++        MANIFEST.into(),
++        manifest
++            .replace("atmosphere.2", "atmosphere.1")
++            .replace("resolution_divisor=2\nhistory=true\n", "")
++            .into_bytes(),
++    );
++    assert!(check(&Pack::from_files(old).unwrap()).is_err());
++}
+diff --git a/crates/horizon-shader-api/tests/schema.rs b/crates/horizon-shader-api/tests/schema.rs
+index bd57269..2272f0b 100644
+--- a/crates/horizon-shader-api/tests/schema.rs
++++ b/crates/horizon-shader-api/tests/schema.rs
+@@ -281,3 +281,35 @@ fn shadow_quality_manifest_is_explicit_and_versioned() {
+         assert!(Manifest::parse(&format!("{base}[sun_shadows]\nquality=\"{invalid}\"\n")).is_err());
+     }
+ }
++
++#[test]
++fn temporal_post_contract_rejects_legacy_and_invalid_targets() {
++    let base = "schema=1\nid=\"t\"\nname=\"T\"\nversion=\"1\"\napi=\"0.1-aurora-atmosphere.2\"\n[sun_shadows]\nquality=\"high\"\n[material]\nfile=\"m.wgsl\"\n[[post]]\nfile=\"h.wgsl\"\nresolution_divisor=2\nhistory=true\n[[post]]\nfile=\"p.wgsl\"\n";
++    assert!(Manifest::parse(base).is_ok());
++    for old in ["0.1-aurora-atmosphere.1", "0.1-aurora-shadow.2"] {
++        assert!(
++            Manifest::parse(&base.replace("0.1-aurora-atmosphere.2", old))
++                .unwrap_err()
++                .contains("require atmosphere.2")
++        );
++    }
++    for bad in [0, 3, 8, 1000] {
++        assert!(
++            Manifest::parse(
++                &base.replace("resolution_divisor=2", &format!("resolution_divisor={bad}"))
++            )
++            .is_err()
++        );
++    }
++    assert!(Manifest::parse(&format!("{base}resolution_divisor=2\n")).is_err());
++    assert!(Manifest::parse(&format!("{base}history=true\n")).is_err());
++    assert!(
++        Manifest::parse(&base.replace("file=\"m.wgsl\"", "file=\"m.wgsl\"\nhistory=false"))
++            .is_err()
++    );
++    let two = base.replace(
++        "[[post]]\nfile=\"p.wgsl\"",
++        "[[post]]\nfile=\"h2.wgsl\"\nhistory=true\n[[post]]\nfile=\"p.wgsl\"",
++    );
++    assert!(Manifest::parse(&two).unwrap_err().contains("one history"));
++}
+diff --git a/docs/api/aurora-temporal.md b/docs/api/aurora-temporal.md
+new file mode 100644
+index 0000000..c700296
+--- /dev/null
++++ b/docs/api/aurora-temporal.md
+@@ -0,0 +1,54 @@
++# Aurora atmosphere.2 — scaled post passes and cloud history
++
++Local opt-in API `0.1-aurora-atmosphere.2`, extending atmosphere.1. The shared
++432-byte frame and existing material/sky/shadow contracts are unchanged. Earlier
++APIs keep the original full-resolution ping-pong renderer and cannot request
++these new manifest keys. This is a fork API, not an upstream release.
++
++Each `[[post]]` may set `resolution_divisor = 1`, `2`, or `4` (default 1).
++Intermediate dimensions are `ceil(world_dimension / divisor)`, at least 1 pixel.
++`PostInput.pixel` is in the current pass target, `uv` remains normalized and
++`frame.resolution` remains the world size. `previous` is the preceding pass at
++its own dimensions. The final pass must be full resolution and cannot retain
++history; sky and material cannot set these keys.
++
++One non-final pass may set `history = true`. Its half-float output is copied to a
++persistent texture immediately after that pass, before the ping-pong slot can be
++reused. A separate R32Float image stores the scene depth at the retained target's
++resolution after all post consumers. This snapshot is an extra small render pass,
++not a copy of the final colour or the hand/HUD. All render targets are bounded by
++the existing pass limit and the three supported resolutions.
++
++The retained pass can read group 3 resources:
++
++- binding 6: `history_color: texture_2d<f32>`, the same pass's preceding result;
++- binding 7: `history_depth: texture_2d<f32>`, nearest scene depth from that frame;
++- binding 8: `post_history`, a 96-byte uniform: previous camera-relative
++  view-projection matrix, `camera_delta.xyz` (current camera minus previous),
++  `camera_delta.w` (history valid), and `clock.xy` (previous/current wrapped seconds).
++
++Only the pass marked `history=true` has defined historical contents. Other post
++passes must not consume these bindings. A pack is responsible for reprojection,
++visibility rejection, neighbourhood clamping and choosing a blend weight. Depth
++is the same reversed opaque-world depth as atmosphere.1, not transparent geometry.
++
++New pack instances, reloads, resized/replaced world targets, nonconsecutive frames,
++dimension/water-medium changes, camera translations of 8+ blocks, large direction
++or projection changes, time jumps, weather jumps and frame gaps of 250+ ms invalidate
++history. The first frame seeds it. Small camera motion uses the preceding exact
++projection (including camera effects/TAA jitter). Lunar phase and existing water
++uniform offsets stay unchanged. History is kept in GPU memory, never in world saves.
++
++Aurora's prototype retains only cloud radiance/transmittance, with 16 jittered
++integration steps. It accumulates sky pixels, rejects previous foreground depth,
++uses a representative point at cloud height 184 (an approximation), compensates
++procedural cloud drift and clamps old colour/opacity to a current 3×3 neighbourhood.
++Motion above 16 half-resolution pixels rejects accumulation; intermediate motion
++reduces its weight. Clouds drawn in front of opaque depth use the current frame
++only. This is not a general TAA implementation or a guarantee against all ghosting.
++
++Tests cover manifest boundaries and legacy rejection, translation to all three
++backends, clock wrapping/camera cuts, and a required GPU test of odd-sized scaled
++passes, floating-point history, previous depth, reset on cut/resize/pack reload.
++The shadow GPU suite also exercises atmosphere.2 with Low and High receivers.
++Run both suites with `AURORA_REQUIRE_GPU=1`; missing hardware must fail preflight.

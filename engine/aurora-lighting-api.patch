@@ -1,0 +1,493 @@
+diff --git a/crates/horizon-client-render/src/gfx.rs b/crates/horizon-client-render/src/gfx.rs
+index 95e49b8..547542b 100644
+--- a/crates/horizon-client-render/src/gfx.rs
++++ b/crates/horizon-client-render/src/gfx.rs
+@@ -24,8 +24,8 @@ const CRUMBLING_BLEND: wgpu::BlendState = wgpu::BlendState {
+     alpha: wgpu::BlendComponent::REPLACE,
+ };
+ /// `TerrainVertex` for `vs_terrain`: position, UV, layer, light, colour.
+-const TERRAIN_ATTRIBUTES: [wgpu::VertexAttribute; 5] =
+-    wgpu::vertex_attr_array![0=>Float32x3,1=>Uint16x2,2=>Uint16,4=>Uint8x2,3=>Unorm8x4];
++const TERRAIN_ATTRIBUTES: [wgpu::VertexAttribute; 6] =
++    wgpu::vertex_attr_array![0=>Float32x3,1=>Uint16x2,2=>Uint16,4=>Uint8x2,3=>Unorm8x4,6=>Unorm8x4];
+ 
+ /// entity.wgsl after the OverlayTexture constants it reads.
+ fn entity_shader() -> String {
+@@ -6111,9 +6111,10 @@ mod tests {
+                 (2, offset_of!(TerrainVertex, layer)),
+                 (4, offset_of!(TerrainVertex, light)),
+                 (3, offset_of!(TerrainVertex, color)),
++                (6, offset_of!(TerrainVertex, lighting)),
+             ]
+         );
+-        assert_eq!(std::mem::size_of::<TerrainVertex>(), 24);
++        assert_eq!(std::mem::size_of::<TerrainVertex>(), 28);
+     }
+     #[test]
+     fn cracks_multiply_instead_of_covering_the_block() {
+diff --git a/crates/horizon-client-render/src/gfx/native_material.rs b/crates/horizon-client-render/src/gfx/native_material.rs
+index be1edbc..bae1bac 100644
+--- a/crates/horizon-client-render/src/gfx/native_material.rs
++++ b/crates/horizon-client-render/src/gfx/native_material.rs
+@@ -30,15 +30,17 @@ struct HorizonMaterialOut {
+     @location(6) spherical: f32,
+     @location(7) cylindrical: f32,
+     @location(8) @interpolate(flat) is_water: u32,
++    @location(9) lighting: vec4<f32>,
+ }
+ fn horizon_material_vertex(position: vec3<f32>, uv: vec2<f32>, layer: u32, color: vec4<f32>,
+-    light: vec2<u32>, origin: vec3<f32>) -> HorizonMaterialOut {
++    light: vec2<u32>, origin: vec3<f32>, lighting: vec4<f32>) -> HorizonMaterialOut {
+     let pos = position + origin;
+     var out: HorizonMaterialOut;
+     out.clip = horizon_terrain_globals.view_proj * vec4(pos, 1.0);
+     out.uv = uv;
+     out.layer = layer;
+     out.tint = vec4(color.rgb, 1.0);
++    out.lighting = lighting;
+     // mesher::NOT_WATER_BIT: clear only for semantic fluid water, not glass.
+     out.is_water = select(0u, 1u, (u32(round(color.a * 255.0)) & 128u) == 0u);
+     let block = max(f32(light.y), horizon_terrain_dynamic_block_light(pos));
+@@ -54,18 +56,18 @@ fn horizon_material_vertex(position: vec3<f32>, uv: vec2<f32>, layer: u32, color
+ @vertex fn horizon_material_vs(
+     @location(0) position: vec3<f32>, @location(1) uv: vec2<u32>,
+     @location(2) layer: u32, @location(3) color: vec4<f32>, @location(4) light: vec2<u32>,
+-    @location(5) origin: vec4<f32>) -> HorizonMaterialOut {
++    @location(5) origin: vec4<f32>, @location(6) lighting: vec4<f32>) -> HorizonMaterialOut {
+     return horizon_material_vertex(position, horizon_terrain_terrain_uv(uv, origin.w), layer,
+-        color, light, origin.xyz);
++        color, light, origin.xyz, lighting);
+ }
+ @vertex fn horizon_material_vs_flat(
+     @builtin(vertex_index) vertex: u32,
+     @location(0) position: vec3<f32>, @location(1) uv: vec2<u32>,
+-    @location(2) layer: u32, @location(3) color: vec4<f32>, @location(4) light: vec2<u32>
++    @location(2) layer: u32, @location(3) color: vec4<f32>, @location(4) light: vec2<u32>, @location(6) lighting: vec4<f32>
+ ) -> HorizonMaterialOut {
+     let origin = horizon_terrain_slot_origins[horizon_terrain_block_slots[vertex >> 8u]];
+     return horizon_material_vertex(position, horizon_terrain_terrain_uv(uv, origin.w), layer,
+-        color, light, origin.xyz);
++        color, light, origin.xyz, lighting);
+ }
+ fn horizon_material_color(in: HorizonMaterialOut, translucent: bool) -> vec4<f32> {
+     let albedo = horizon_terrain_sprite(in.uv, in.layer & 0x7fffu);
+@@ -140,6 +142,12 @@ fn horizon_material_fog(in: HorizonMaterialOut) -> vec4<f32> {
+             .replace("return horizon_terrain_apply_fog(color, in.spherical, in.cylindrical);",
+                 "if surface.scene_composited { return color; }\n    return horizon_terrain_apply_fog(color, in.spherical, in.cylindrical);");
+     }
++    if stage.clean_lighting {
++        entries = entries.replace(
++            "horizon_material_fog(in)));",
++            "horizon_material_fog(in), in.lighting));",
++        );
++    }
+     format!(
+         "{}\n// Horizon's terrain (terrain.wgsl)\n{}{}",
+         stage.source,
+@@ -434,6 +442,98 @@ mod tests {
+             .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&shader_source(&stage))));
+         }
+     }
++    #[test]
++    fn clean_lighting_composes_without_changing_older_material_inputs() {
++        use horizon_shader_api::manifest::AURORA_LIGHTING_API;
++        let manifest = format!(
++            "schema=1\nid=\"lighting\"\nname=\"Lighting\"\nversion=\"1\"\napi=\"{AURORA_LIGHTING_API}\"\n[sun_shadows]\nquality=\"high\"\n[material]\nfile=\"m.wgsl\"\n[[post]]\nfile=\"p.wgsl\"\n"
++        );
++        let material = "fn material(i: MaterialInput) -> Surface {
++            return Surface(vec4(i.albedo.rgb * i.lighting.rgb * i.lighting.a, i.albedo.a), false);
++        }";
++        let files = [
++            (MANIFEST, manifest.as_str()),
++            ("m.wgsl", material),
++            (
++                "p.wgsl",
++                "fn post(i: PostInput) -> vec4<f32> { return i.color; }",
++            ),
++        ]
++        .map(|(k, v)| (k.into(), v.as_bytes().to_vec()))
++        .into();
++        let report = check(&Pack::from_files(files).unwrap()).unwrap();
++        assert!(report.stages.iter().all(|s| s.temporal_api));
++        let stage = &report.stages[0];
++        assert!(stage.clean_lighting);
++        let text = shader_source(stage);
++        let module = module(stage).unwrap();
++        naga::valid::Validator::new(
++            naga::valid::ValidationFlags::all(),
++            naga::valid::Capabilities::all(),
++        )
++        .validate(&module)
++        .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&text)));
++        assert!(text.contains("horizon_material_fog(in), in.lighting"));
++        let old = StageKind::Material.prelude_for("0.1-aurora-atmosphere.2");
++        assert!(!old.contains("    lighting: vec4<f32>"));
++        assert!(
++            StageKind::Post
++                .prelude_for(AURORA_LIGHTING_API)
++                .contains("post_history")
++        );
++    }
++
++    #[test]
++    #[ignore = "developer harness: set HORIZON_VALIDATE_SHADER_PACK to a local pack"]
++    fn local_pack_pipelines_on_gpu() {
++        let path = std::env::var("HORIZON_VALIDATE_SHADER_PACK").expect("pack path");
++        let pack = Pack::read(std::path::Path::new(&path)).unwrap();
++        let report = check(&pack).unwrap();
++        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
++        let adapter = pollster::block_on(instance.request_adapter(&Default::default()))
++            .expect("GPU adapter required for local pack pipeline check");
++        eprintln!("Lighting pack GPU: {:?}", adapter.get_info());
++        let (device, _) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
++        let entries: Vec<_> = (0..12)
++            .map(|binding| wgpu::BindGroupLayoutEntry {
++                binding,
++                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
++                count: None,
++                ty: match binding {
++                    0 => wgpu::BindingType::Buffer {
++                        ty: wgpu::BufferBindingType::Uniform,
++                        has_dynamic_offset: false,
++                        min_binding_size: None,
++                    },
++                    2 | 4 => wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
++                    b => wgpu::BindingType::Texture {
++                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
++                        view_dimension: if b == 3 {
++                            wgpu::TextureViewDimension::D2
++                        } else {
++                            wgpu::TextureViewDimension::D2Array
++                        },
++                        multisampled: false,
++                    },
++                },
++            })
++            .collect();
++        let globals = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++            label: None,
++            entries: &entries,
++        });
++        let shape = TerrainShape {
++            globals: &globals,
++            flat: None,
++            sprites: [1.0, 2048.0],
++            format: wgpu::TextureFormat::Rgba8Unorm,
++        };
++        let (_, labels) =
++            super::super::native_pack::NativePack::new(&device, &shape, report, &[]).unwrap();
++        assert!(!labels.is_empty());
++        eprintln!("Compiled local pack pipelines: {labels:?}");
++    }
++
+     #[test]
+     #[ignore = "developer harness: set HORIZON_VALIDATE_SHADER_PACK to a local pack"]
+     fn local_pack_composes_with_renderer() {
+diff --git a/crates/horizon-client-render/src/mesher.rs b/crates/horizon-client-render/src/mesher.rs
+index 1abcd66..f090b4b 100644
+--- a/crates/horizon-client-render/src/mesher.rs
++++ b/crates/horizon-client-render/src/mesher.rs
+@@ -46,8 +46,8 @@ pub struct Vertex {
+ /// back faces, which the entity pipelines here do not, so `entity.wgsl` discards them.
+ pub const CULL_BACK: [i8; 4] = [0, 0, 0, 1];
+ /// A section vertex: vanilla's `DefaultVertexFormat.BLOCK` (position, colour,
+-/// UV0, UV2) with the sprite's array layer beside the light, in 24 bytes
+-/// rather than vanilla's 28: the UV is fixed point, which holds model UVs
++/// UV0, UV2) with the sprite's array layer beside the light. This local fork uses
++/// 28 bytes: 24 for vanilla data and four for unshaded tint/AO. Fixed-point UVs hold model UVs
+ /// (multiples of 1/16 and their halves) exactly. The position stays a float:
+ /// fixed point would move the edges of offset plants and rotated elements by
+ /// a fraction of a pixel. Terrain has no normal: `ModelBlockRenderer` bakes
+@@ -67,6 +67,9 @@ pub struct TerrainVertex {
+     pub light: u16,
+     /// RGBA8: tint multiplied by directional shade and ambient occlusion.
+     pub color: u32,
++    /// Unshaded biome RGB and AO in alpha, for Aurora lighting. Alpha zero
++    /// means unavailable (fluids, LOD and legacy construction); use color then.
++    pub lighting: u32,
+ }
+ /// Fixed-point steps per unit of `TerrainVertex` UVs, which span `[0, 2)`.
+ pub const UV_STEPS: f32 = 32768.0;
+@@ -81,6 +84,7 @@ impl TerrainVertex {
+             layer,
+             light,
+             color,
++            lighting: 0,
+         }
+     }
+     /// A vertex of a merged distant-terrain face, its UV in blocks from the
+@@ -92,8 +96,17 @@ impl TerrainVertex {
+             layer,
+             light,
+             color,
++            lighting: 0,
+         }
+     }
++    /// Preserve vanilla's packed color and expose the original model lighting separately.
++    fn with_lighting(mut self, tint: Option<u32>, ao: f32) -> Self {
++        let tint = tint.unwrap_or(0xFF_FF_FF);
++        let rgb = [16, 8, 0].map(|shift| (tint >> shift) & 255);
++        let ao = (ao.clamp(0.0, 1.0) * 255.0).round().clamp(1.0, 255.0) as u32;
++        self.lighting = (pack_rgb(rgb) & 0x00FF_FFFF) | (ao << 24);
++        self
++    }
+     /// The UV the GPU samples.
+     pub fn uv(&self) -> [f32; 2] {
+         self.uv.map(|v| f32::from(v) / UV_STEPS)
+@@ -103,6 +116,16 @@ impl TerrainVertex {
+ mod vertex_tests {
+     use super::TerrainVertex;
+     #[test]
++    fn clean_lighting_does_not_change_vanilla_color_or_light() {
++        let v = TerrainVertex::new([0.0; 3], [0.0; 2], 7, 0xFE123456, 0xF0F0);
++        assert_eq!(v.lighting, 0);
++        let lit = v.with_lighting(Some(0x12_34_56), 0.5);
++        assert_eq!(lit.lighting, 0x8056_3412);
++        assert_eq!(lit.color, v.color);
++        assert_eq!(lit.light, v.light);
++        assert_eq!(v.with_lighting(None, 1.0).lighting, 0xFFFF_FFFF);
++    }
++    #[test]
+     fn model_uvs_pack_exactly() {
+         for i in 0..=32 {
+             let u = i as f32 / 32.0;
+@@ -132,7 +155,7 @@ mod vertex_tests {
+     }
+     #[test]
+     fn water_tag_preserves_rgb_hdr_and_vertex_layout() {
+-        assert_eq!(std::mem::size_of::<TerrainVertex>(), 24);
++        assert_eq!(std::mem::size_of::<TerrainVertex>(), 28);
+         let rgb = super::pack_rgb([0x12, 0x34, 0x56]);
+         for tier in 0..=super::VERY_BRIGHT {
+             let plain = super::emitting(rgb, tier);
+@@ -694,7 +717,7 @@ pub const OPAQUE_LAYER: u16 = 1 << 15;
+ /// bit 7 marks non-water and the other three bits stay set.
+ pub const EMISSION_BITS: u32 = 0x0F00_0000;
+ /// Cleared only on fluid water vertices. This unused alpha bit preserves the
+-/// 24-byte vertex and the low-nibble HDR tier; shaders never use vertex alpha
++/// existing color field and the low-nibble HDR tier; shaders never use vertex alpha
+ /// as opacity. Native material packs receive it as `MaterialInput.is_water`.
+ pub const NOT_WATER_BIT: u32 = 0x8000_0000;
+ /// HDR tiers, by the kind of light rather than its level: a candle's flame is as bright as
+@@ -1003,18 +1026,18 @@ impl Mesher<'_> {
+         let shade_face = q.shade_direction_override.unwrap_or(q.facing);
+         let directional = lighting::cardinal(self.nether_shading, shade_face);
+         // Grey level per vertex before tinting, and vanilla light coords.
+-        let (gray, coords) = if ao {
++        let (gray, coords, ambient) = if ao {
+             let info = &self.tables.info;
+             let (brightness, coords) =
+                 lighting::ambient_occlusion(pad, info, state, pos, &q.positions, q.facing);
+             let gray = brightness.map(|b| lighting::scale(lighting::gray(b), directional));
+-            (gray, coords)
++            (gray, coords, brightness)
+         } else {
+             let coords = match q.cull {
+                 Some(d) => lighting::coords(pad, state, lighting::step(pos, d)),
+                 None => lighting::flat(pad, state, pos, &q.positions, q.facing),
+             };
+-            ([lighting::gray(directional); 4], [coords; 4])
++            ([lighting::gray(directional); 4], [coords; 4], [1.0; 4])
+         };
+         let tint = Self::tint(state, q.tint_index, tints, pos);
+         let target = if face.translucent {
+@@ -1029,19 +1052,22 @@ impl Mesher<'_> {
+                 None => [g; 3],
+             };
+             let p = q.positions[i];
+-            target.push(TerrainVertex::new(
+-                [p[0] + origin[0], p[1] + origin[1], p[2] + origin[2]],
+-                q.uv[i],
+-                // Opaque leaves (forceOpaque) and quads over opaque texels draw in the
+-                // solid layer: no alpha cutout (a dirt path's side skips its clear top row).
+-                if face.opaque && !face.translucent || !self.cutout_leaves && state.leaves {
+-                    face.layer as u16 | OPAQUE_LAYER
+-                } else {
+-                    face.layer as u16
+-                },
+-                emitting(pack_rgb(rgb), tier),
+-                pack_coords(lighting::with_emission(coords[i], q.light_emission)),
+-            ));
++            target.push(
++                TerrainVertex::new(
++                    [p[0] + origin[0], p[1] + origin[1], p[2] + origin[2]],
++                    q.uv[i],
++                    // Opaque leaves (forceOpaque) and quads over opaque texels draw in the
++                    // solid layer: no alpha cutout (a dirt path's side skips its clear top row).
++                    if face.opaque && !face.translucent || !self.cutout_leaves && state.leaves {
++                        face.layer as u16 | OPAQUE_LAYER
++                    } else {
++                        face.layer as u16
++                    },
++                    emitting(pack_rgb(rgb), tier),
++                    pack_coords(lighting::with_emission(coords[i], q.light_emission)),
++                )
++                .with_lighting(tint, ambient[i]),
++            );
+         }
+     }
+ }
+diff --git a/crates/horizon-shader-api/src/check.rs b/crates/horizon-shader-api/src/check.rs
+index 73e55e6..0edc416 100644
+--- a/crates/horizon-shader-api/src/check.rs
++++ b/crates/horizon-shader-api/src/check.rs
+@@ -56,6 +56,7 @@ fn problem(file: &str, message: impl Into<String>) -> Problem {
+ pub struct CheckedStage {
+     pub kind: StageKind,
+     pub temporal_api: bool,
++    pub clean_lighting: bool,
+     pub resolution_divisor: u32,
+     pub history: bool,
+     /// The opt-in water.2 material stage needs a pre-translucent scene snapshot.
+@@ -185,7 +186,8 @@ pub fn check_stage(pack: &Pack, kind: StageKind, file: &str) -> Result<CheckedSt
+     let post = pack.manifest.post.iter().find(|s| s.file == file);
+     Ok(CheckedStage {
+         kind,
+-        temporal_api: pack.manifest.api == crate::manifest::AURORA_TEMPORAL_API,
++        temporal_api: crate::manifest::has_temporal(&pack.manifest.api),
++        clean_lighting: pack.manifest.api == crate::manifest::AURORA_LIGHTING_API,
+         resolution_divisor: post.and_then(|s| s.resolution_divisor).unwrap_or(1),
+         history: post.and_then(|s| s.history).unwrap_or(false),
+         sun_shadow: (kind == StageKind::Material
+diff --git a/crates/horizon-shader-api/src/manifest.rs b/crates/horizon-shader-api/src/manifest.rs
+index c1c188e..e0c9be2 100644
+--- a/crates/horizon-shader-api/src/manifest.rs
++++ b/crates/horizon-shader-api/src/manifest.rs
+@@ -22,13 +22,25 @@ pub const AURORA_SHADOW_QUALITY_API: &str = "0.1-aurora-shadow.2";
+ pub const AURORA_ATMOSPHERE_API: &str = "0.1-aurora-atmosphere.1";
+ /// Scaled post passes and an opt-in cloud history; older APIs retain their ABI.
+ pub const AURORA_TEMPORAL_API: &str = "0.1-aurora-atmosphere.2";
++/// Clean terrain tint and AO for independent sunlight / sky / local lighting.
++pub const AURORA_LIGHTING_API: &str = "0.1-aurora-lighting.1";
++pub fn has_temporal(api: &str) -> bool {
++    matches!(api, AURORA_TEMPORAL_API | AURORA_LIGHTING_API)
++}
+ pub fn has_atmosphere(api: &str) -> bool {
+-    matches!(api, AURORA_ATMOSPHERE_API | AURORA_TEMPORAL_API)
++    matches!(
++        api,
++        AURORA_ATMOSPHERE_API | AURORA_TEMPORAL_API | AURORA_LIGHTING_API
++    )
+ }
+ pub fn has_sun_shadow(api: &str) -> bool {
+     matches!(
+         api,
+-        AURORA_SHADOW_API | AURORA_SHADOW_QUALITY_API | AURORA_ATMOSPHERE_API | AURORA_TEMPORAL_API
++        AURORA_SHADOW_API
++            | AURORA_SHADOW_QUALITY_API
++            | AURORA_ATMOSPHERE_API
++            | AURORA_TEMPORAL_API
++            | AURORA_LIGHTING_API
+     )
+ }
+ pub fn has_water_environment(api: &str) -> bool {
+@@ -249,9 +261,10 @@ impl Manifest {
+             && raw.api != AURORA_SHADOW_QUALITY_API
+             && raw.api != AURORA_ATMOSPHERE_API
+             && raw.api != AURORA_TEMPORAL_API
++            && raw.api != AURORA_LIGHTING_API
+         {
+             return Err(err(format!(
+-                "written for shader API {}; this Horizon serves {API}, {AURORA_WATER_API}, {AURORA_SCENE_API}, {AURORA_IMMERSION_API}, {AURORA_SHADOW_API}, {AURORA_SHADOW_QUALITY_API}, {AURORA_ATMOSPHERE_API} and {AURORA_TEMPORAL_API}",
++                "written for shader API {}; this Horizon serves {API}, {AURORA_WATER_API}, {AURORA_SCENE_API}, {AURORA_IMMERSION_API}, {AURORA_SHADOW_API}, {AURORA_SHADOW_QUALITY_API}, {AURORA_ATMOSPHERE_API}, {AURORA_TEMPORAL_API} and {AURORA_LIGHTING_API}",
+                 raw.api
+             )));
+         }
+@@ -278,7 +291,10 @@ impl Manifest {
+         }
+         if matches!(
+             raw.api.as_str(),
+-            AURORA_SHADOW_QUALITY_API | AURORA_ATMOSPHERE_API | AURORA_TEMPORAL_API
++            AURORA_SHADOW_QUALITY_API
++                | AURORA_ATMOSPHERE_API
++                | AURORA_TEMPORAL_API
++                | AURORA_LIGHTING_API
+         ) {
+             if raw.sun_shadows.is_none() || raw.material.is_none() {
+                 return Err(err(
+@@ -306,7 +322,7 @@ impl Manifest {
+         }
+         let mut histories = 0;
+         for (index, stage) in raw.post.iter().enumerate() {
+-            if raw.api != AURORA_TEMPORAL_API
++            if !has_temporal(&raw.api)
+                 && (stage.resolution_divisor.is_some() || stage.history.is_some())
+             {
+                 return Err(err("scaled passes and history require atmosphere.2".into()));
+diff --git a/crates/horizon-shader-api/src/stages.rs b/crates/horizon-shader-api/src/stages.rs
+index fa4600f..f38c7b5 100644
+--- a/crates/horizon-shader-api/src/stages.rs
++++ b/crates/horizon-shader-api/src/stages.rs
+@@ -252,6 +252,9 @@ impl StageKind {
+             );
+             out += SCENE_PRELUDE;
+         }
++        if self == StageKind::Material && api == crate::manifest::AURORA_LIGHTING_API {
++            out = out.replace("    fog: vec4<f32>,", "    fog: vec4<f32>,\n    // RGB: unshaded biome tint; alpha: AO, zero means unavailable.\n    lighting: vec4<f32>,");
++        }
+         if self == StageKind::Material && api == crate::manifest::AURORA_SHADOW_API {
+             out += include_str!("sun_shadow.wgsl");
+         }
+@@ -269,7 +272,7 @@ impl StageKind {
+                 out += include_str!("sun_volume.wgsl");
+             }
+         }
+-        if self == StageKind::Post && api == crate::manifest::AURORA_TEMPORAL_API {
++        if self == StageKind::Post && crate::manifest::has_temporal(api) {
+             out += include_str!("post_history.wgsl");
+         }
+         out
+@@ -349,6 +352,14 @@ pub fn compose(pack: &Pack, kind: StageKind, file: &str) -> Composed {
+         } else {
+             kind.entries().to_owned()
+         };
++    let entries = if kind == StageKind::Material
++        && pack.manifest.api == crate::manifest::AURORA_LIGHTING_API
++    {
++        entries.replace("    @location(7) @interpolate(flat) is_water: u32,", "    @location(7) @interpolate(flat) is_water: u32,\n    @location(8) lighting: vec4<f32>,")
++            .replace("vec4(frame.fog_color, 0.0));", "vec4(frame.fog_color, 0.0), in.lighting);")
++    } else {
++        entries
++    };
+     push("<entries>", &entries);
+     composed
+ }
+diff --git a/docs/api/aurora-lighting.md b/docs/api/aurora-lighting.md
+new file mode 100644
+index 0000000..143f955
+--- /dev/null
++++ b/docs/api/aurora-lighting.md
+@@ -0,0 +1,33 @@
++# Aurora lighting.1 (local fork)
++
++Experimental API `0.1-aurora-lighting.1` extends `0.1-aurora-atmosphere.2`.
++It is not supported by stock Horizon. Existing API lines retain their stage ABI.
++
++The material input appends `lighting: vec4<f32>` after `fog`:
++
++- RGB is the model's original biome/constant tint, normalized to 0..1, without
++  baked cardinal shade or ambient occlusion. Untinted models receive white.
++- Alpha is interpolated model ambient occlusion, quantized to 1..255 / 255.
++  With AO disabled it is 1. Zero is reserved for unavailable data.
++- Fluid meshes, merged LOD geometry and legacy vertex constructors carry zero
++  alpha. A pack must retain its old material path for them. This field is not
++  an opacity or an emissive mask.
++
++Terrain vertices grow from 24 to 28 bytes. The existing color/light fields and
++water/HDR metadata are unchanged; vertex attribute location 6 transports the
++new RGBA8 value in instanced and flat native material pipelines. Model normals
++are not added: Aurora reconstructs the visible geometric normal from fragment
++derivatives before divergent branches. Entities and the first-person hand do
++not use this terrain material API.
++
++Frame uniforms, scene snapshot, shadow bindings and cloud history match
++atmosphere.2. The world target still stores SDR/gamma colour. This extension
++does not provide full-scene HDR, exposure metering, indirect light transport,
++per-source block-light colours, or new reflection data. Aurora computes terrain
++illumination in linear light and compresses/encodes it before returning Surface;
++engine fog and water composition retain their existing display-space contract.
++
++Validation includes packed-layout and color-preservation tests, old/new material
++composition, the SDK checks on all option extrema, and the opt-in
++`local_pack_pipelines_on_gpu` harness. Set `HORIZON_VALIDATE_SHADER_PACK` to a
++pack and run the latter with `--ignored --nocapture` on a real GPU.

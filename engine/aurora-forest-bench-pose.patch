@@ -1,0 +1,132 @@
+diff --git a/crates/horizon-client/src/bin/horizon-ctl/commands.rs b/crates/horizon-client/src/bin/horizon-ctl/commands.rs
+index f874080..ff465f7 100644
+--- a/crates/horizon-client/src/bin/horizon-ctl/commands.rs
++++ b/crates/horizon-client/src/bin/horizon-ctl/commands.rs
+@@ -441,6 +441,9 @@ pub const COMMANDS: &[Cmd] = &[
+         ["horizon-ctl mcp"], &[], mcp: false, local: true),
+     cmd!("bench", Scripting, "bench SECONDS", "reset frame stats, wait, reply with the summary", "", ["horizon-ctl bench 10"], &[p("seconds", Ty::Num, "how long to measure")], mcp: true, local: false),
+     cmd!("stats", Scripting, "stats [reset]", "frame-time summary since the last reset", "", ["horizon-ctl stats"], &[opt("reset", Ty::Bool, "start counting again")], mcp: true, local: false),
++    cmd!("bench-pose", Scripting, "bench-pose X Y Z YAW PITCH SECONDS", "time a fixed camera pose",
++        "Applies the position and angles before every render. Returns frame statistics and the held camera pose at completion.",
++        ["horizon-ctl bench-pose 13.5 63.5 23.5 -80 6 8"], &[], mcp: false, local: false),
+     cmd!("fly", Scripting, "fly X1 Y1 Z1 X2 Y2 Z2 SECONDS [PITCH [raw]]", "fly the camera along a line, then reply with the frame summary",
+         "The reply's tick_ms and tick_ms_max are the world's smoothed tick time over the flight (the server thread's when single player runs on one). With raw, the reply also lists every frame time in milliseconds (frame_ms).",
+         ["horizon-ctl fly 0 100 0 500 100 0 20"], &[], mcp: false, local: false),
+diff --git a/crates/horizon-client/src/game/control.rs b/crates/horizon-client/src/game/control.rs
+index 958ea0f..2606315 100644
+--- a/crates/horizon-client/src/game/control.rs
++++ b/crates/horizon-client/src/game/control.rs
+@@ -37,6 +37,7 @@ const HELP: &[&str] = &[
+     "options [PAGE]                 open the options (video sound controls keybinds mouse chat accessibility language font packs mods graphics graphics-advanced graphics-hdr)",
+     "stats [reset]                  frame-time summary since the last reset",
+     "bench SECONDS                  reset stats, wait, then reply with the summary",
++    "bench-pose X Y Z YAW PITCH SECONDS   benchmark with a fixed camera before every render",
+     "fly X1 Y1 Z1 X2 Y2 Z2 SECONDS [PITCH [raw]]  fly the camera along a line at constant speed, then reply with the frame summary (raw: every frame time too)",
+     "open WORLD [SEED] [creative]   open or create a world from the title screen",
+     "save                           save the world",
+@@ -54,6 +55,8 @@ const HELP: &[&str] = &[
+ pub struct Flight {
+     from: Vec3,
+     to: Vec3,
++    // Some for a stationary benchmark. A zero-length flight has no heading.
++    hold_yaw: Option<f32>,
+     pitch: f32,
+     started: Instant,
+     seconds: f64,
+@@ -82,7 +85,9 @@ impl Game<'_> {
+         let d = [b.x - a.x, b.y - a.y, b.z - a.z];
+         let at = Vec3::new(a.x + d[0] * t, a.y + d[1] * t, a.z + d[2] * t);
+         // Minecraft yaw: 0 faces +Z, 90 faces -X.
+-        self.yaw = (-d[0]).atan2(d[2]).to_degrees() as f32;
++        self.yaw = flight
++            .hold_yaw
++            .unwrap_or_else(|| (-d[0]).atan2(d[2]).to_degrees() as f32);
+         self.pitch = flight.pitch;
+         if let Some(player) = self.player.as_mut() {
+             player.position = at;
+@@ -99,6 +104,16 @@ impl Game<'_> {
+             let n = flight.tick_ms.len().max(1) as f32;
+             summary["tick_ms"] = (flight.tick_ms.iter().sum::<f32>() / n).into();
+             summary["tick_ms_max"] = flight.tick_ms.iter().copied().fold(0.0, f32::max).into();
++            if flight.hold_yaw.is_some() {
++                // Captured while the lock is still applied, on the render thread.
++                if let Some(player) = &self.player {
++                    summary["held_camera"] = json!({
++                        "position": [player.position.x, player.position.y, player.position.z],
++                        "yaw": self.yaw, "pitch": self.pitch, "flying": player.flying,
++                        "updates": flight.tick_ms.len()
++                    });
++                }
++            }
+             if flight.raw {
+                 summary["frame_ms"] = self.frame_stats.frame_millis().into();
+                 summary["cpu_ms"] = self.frame_stats.cpu_millis().into();
+@@ -722,21 +737,52 @@ impl Game<'_> {
+                 ));
+                 Ok(None)
+             }
+-            "fly" => {
++            "fly" | "bench-pose" => {
+                 self.require_world()?;
+                 if self.flight.is_some() || self.pending_bench.is_some() {
+                     return Err("a benchmark is already running".into());
+                 }
+                 let n = |i: usize| -> Result<f64> { Ok(arg(i)?.parse()?) };
+-                let pitch = words.get(8).map_or(Ok(10.0), |p| p.parse::<f32>())?;
++                let from = Vec3::new(n(1)?, n(2)?, n(3)?);
++                let (to, hold_yaw, pitch, seconds, raw) = if words[0] == "bench-pose" {
++                    if words.len() != 7 {
++                        return Err("usage: bench-pose X Y Z YAW PITCH SECONDS".into());
++                    }
++                    let yaw: f32 = arg(4)?.parse()?;
++                    let pitch: f32 = arg(5)?.parse()?;
++                    let seconds = n(6)?;
++                    if ![from.x, from.y, from.z, seconds]
++                        .into_iter()
++                        .all(f64::is_finite)
++                        || !yaw.is_finite()
++                        || !(-90.0..=90.0).contains(&pitch)
++                        || seconds <= 0.0
++                    {
++                        return Err(
++                            "bench-pose needs finite coordinates, valid angles and positive duration"
++                                .into(),
++                        );
++                    }
++                    (from, Some(yaw), pitch, seconds, false)
++                } else {
++                    let pitch = words.get(8).map_or(Ok(10.0), |p| p.parse::<f32>())?;
++                    (
++                        Vec3::new(n(4)?, n(5)?, n(6)?),
++                        None,
++                        pitch,
++                        n(7)?.max(0.1),
++                        words.get(9) == Some(&"raw"),
++                    )
++                };
+                 self.frame_stats.reset();
+                 self.flight = Some(Flight {
+-                    from: Vec3::new(n(1)?, n(2)?, n(3)?),
+-                    to: Vec3::new(n(4)?, n(5)?, n(6)?),
++                    from,
++                    to,
++                    hold_yaw,
+                     pitch,
+                     started: Instant::now(),
+-                    seconds: n(7)?.max(0.1),
+-                    raw: words.get(9) == Some(&"raw"),
++                    seconds,
++                    raw,
+                     reply: reply.clone(),
+                     tick_ms: Vec::new(),
+                 });
+diff --git a/docs/horizon-ctl-commands.md b/docs/horizon-ctl-commands.md
+index 93163c3..0820306 100644
+--- a/docs/horizon-ctl-commands.md
++++ b/docs/horizon-ctl-commands.md
+@@ -137,4 +137,5 @@ Every command `horizon-ctl` takes, its MCP tool in `horizon-ctl mcp` (the launch
+ | `mcp` | CLI only | Serve the Model Context Protocol on stdin/stdout, one tool per command | none |
+ | `bench SECONDS` | `bench` | Reset frame stats, wait, reply with the summary | `seconds` (number, required): how long to measure |
+ | `stats [reset]` | `stats` | Frame-time summary since the last reset | `reset` (boolean): start counting again |
++| `bench-pose X Y Z YAW PITCH SECONDS` | CLI only | Time a fixed camera pose | none |
+ | `fly X1 Y1 Z1 X2 Y2 Z2 SECONDS [PITCH [raw]]` | CLI only | Fly the camera along a line, then reply with the frame summary | none |

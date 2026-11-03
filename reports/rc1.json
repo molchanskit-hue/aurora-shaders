@@ -1,0 +1,333 @@
+{
+  "version": "0.10.1-rc.1",
+  "gpu": "Apple M3 Pro",
+  "backend": "Metal",
+  "render_distance": 8,
+  "seed": 42,
+  "visual_review": {
+    "framebuffer": [
+      3600,
+      2260
+    ],
+    "observed": "Developer watched both continuous thirty-second sweeps in full rain and reported no flicker in either variant. Medium Rain 24 selected.",
+    "viewed_turns": {
+      "fixed32": [
+        -65.0000228881836,
+        -95.00005340576172
+      ],
+      "rain24": [
+        -65.00007629394531,
+        -94.99991607666016
+      ]
+    }
+  },
+  "resolution_test": {
+    "mode": "presented window",
+    "scene": "shoreline, full rain, time 2245",
+    "method": "Four eight-second intervals per variant in ABBA/BAAB order. For 60 FPS require both average and 1% low >=60 in each candidate interval.",
+    "results": {
+      "1440p": {
+        "framebuffer": [
+          2560,
+          1440
+        ],
+        "raw_sha256": "4712e7274ea6116ee02d5f9e00ee4fa016afedf04b73809d7971283e2a6dbe62",
+        "accepted_intervals": 8,
+        "rejected_intervals": 0,
+        "levels": {
+          "fixed32": {
+            "rejected_intervals": 0,
+            "fps": 77.56144815422101,
+            "one_percent_low": 45.172337127468865,
+            "gpu_ms": 12.865047941667044,
+            "p95_frame_ms": 15.941635608673096,
+            "gpu_runs_ms": [
+              12.842071931845124,
+              12.850685678626412,
+              12.853886900700616,
+              12.913547255496024
+            ],
+            "frames": [
+              622,
+              621,
+              621,
+              619
+            ],
+            "lowest_trial_1pct_fps": 44.007893902538626,
+            "met_60_every_trial": false
+          },
+          "rain24": {
+            "rejected_intervals": 0,
+            "fps": 83.67283798584141,
+            "one_percent_low": 46.03205160293052,
+            "gpu_ms": 11.932088528327155,
+            "p95_frame_ms": 15.649364709854126,
+            "gpu_runs_ms": [
+              12.494181098699196,
+              11.756204881387598,
+              11.739597303751808,
+              11.738370829470018
+            ],
+            "frames": [
+              639,
+              680,
+              680,
+              680
+            ],
+            "lowest_trial_1pct_fps": 40.55324237947399,
+            "met_60_every_trial": false
+          }
+        }
+      },
+      "1080p": {
+        "framebuffer": [
+          1920,
+          1080
+        ],
+        "raw_sha256": "135e6b0a16aad7ff129200796faa9a9fbe01cc7f2426e06fd4891d3b048e5181",
+        "accepted_intervals": 8,
+        "rejected_intervals": 0,
+        "levels": {
+          "fixed32": {
+            "rejected_intervals": 0,
+            "fps": 119.66759377145982,
+            "one_percent_low": 66.82681979114011,
+            "gpu_ms": 8.331087076910306,
+            "p95_frame_ms": 14.217458248138428,
+            "gpu_runs_ms": [
+              8.322425649658872,
+              8.338211400880086,
+              8.32640873392423,
+              8.337302523178037
+            ],
+            "frames": [
+              958,
+              957,
+              960,
+              956
+            ],
+            "lowest_trial_1pct_fps": 65.2008959203613,
+            "met_60_every_trial": true
+          },
+          "rain24": {
+            "rejected_intervals": 0,
+            "fps": 121.60778921181816,
+            "one_percent_low": 64.32203144209016,
+            "gpu_ms": 7.690732678630949,
+            "p95_frame_ms": 14.431583166122437,
+            "gpu_runs_ms": [
+              7.706019715529222,
+              7.687298934154021,
+              7.674703543247321,
+              7.694908521593232
+            ],
+            "frames": [
+              975,
+              975,
+              974,
+              969
+            ],
+            "lowest_trial_1pct_fps": 62.07501234247143,
+            "met_60_every_trial": true
+          }
+        }
+      }
+    }
+  },
+  "route": {
+    "scene": "clear day, forest to shore, refreshed chunks, submerged view and return turn",
+    "framebuffer": [
+      1920,
+      1080
+    ],
+    "warmup_seconds": 60.00598780697584,
+    "raw_sha256": "cd0f95d8bebc30da5fa0ba9b6860e125b44a96ca21a6bf04bd31914dce149b85",
+    "levels": {
+      "low": {
+        "archive": {
+          "file": "aurora-low-0.10.1-rc.1.hshader",
+          "sha256": "a675fe043e9275af9d88a21cbb9bb11e3b3ae689ac1fcd4128708c006bc819f4"
+        },
+        "stationary": {
+          "forest": {
+            "avg_fps": 140.57625655093392,
+            "frames": 1126,
+            "low_1pct_fps": 63.03447899905457,
+            "p95_ms": 13.446874618530272,
+            "seconds": 8.0098874989748,
+            "gpu_ms": 6.097904016406746
+          },
+          "shore": {
+            "avg_fps": 139.86792536974232,
+            "frames": 1120,
+            "low_1pct_fps": 60.653859638920615,
+            "p95_ms": 13.490333557128906,
+            "seconds": 8.007554248332978,
+            "gpu_ms": 5.943876674832455
+          },
+          "submerged": {
+            "avg_fps": 136.63784741852396,
+            "frames": 1093,
+            "low_1pct_fps": 59.06373213506647,
+            "p95_ms": 14.177249908447266,
+            "seconds": 7.999247797369957,
+            "gpu_ms": 6.233058297361957
+          }
+        },
+        "flight": {
+          "avg_fps": 140.59322759086484,
+          "frames": 1687,
+          "low_1pct_fps": 59.35934660347556,
+          "p95_ms": 13.503416061401367,
+          "seconds": 11.999155499219894,
+          "gpu_ms": 5.98820564502361
+        },
+        "columns_received": 190
+      },
+      "medium": {
+        "archive": {
+          "file": "aurora-medium-0.10.1-rc.1.hshader",
+          "sha256": "4858a06499c760fa146aa88fbfcc76e1b3fae54238a8b8e58fc1bf0002836361"
+        },
+        "stationary": {
+          "forest": {
+            "avg_fps": 145.75105239210197,
+            "frames": 1166,
+            "low_1pct_fps": 67.54780585391212,
+            "p95_ms": 13.314624786376951,
+            "seconds": 7.999942236185074,
+            "gpu_ms": 6.072359396294909
+          },
+          "shore": {
+            "avg_fps": 135.6561085620416,
+            "frames": 1086,
+            "low_1pct_fps": 67.45586560703337,
+            "p95_ms": 11.913125038146973,
+            "seconds": 8.005537026762962,
+            "gpu_ms": 6.3963853474260475
+          },
+          "submerged": {
+            "avg_fps": 138.17592709994057,
+            "frames": 1105,
+            "low_1pct_fps": 56.723206676044,
+            "p95_ms": 13.31387424468994,
+            "seconds": 7.997051463246345,
+            "gpu_ms": 5.998284012025347
+          }
+        },
+        "flight": {
+          "avg_fps": 139.2450825084997,
+          "frames": 1672,
+          "low_1pct_fps": 64.26759582653347,
+          "p95_ms": 12.900084495544434,
+          "seconds": 12.007605366587638,
+          "gpu_ms": 6.307818945800288
+        },
+        "columns_received": 190
+      },
+      "high": {
+        "archive": {
+          "file": "aurora-reflections-0.10.1-rc.1.hshader",
+          "sha256": "43df9b06362d56b5e31a708112b541a95b0f8b4cc7799bbe83cfd331819c970a"
+        },
+        "stationary": {
+          "forest": {
+            "avg_fps": 139.80076283354177,
+            "frames": 1120,
+            "low_1pct_fps": 62.00236569529934,
+            "p95_ms": 12.417291641235352,
+            "seconds": 8.011401206254959,
+            "gpu_ms": 6.411644351056644
+          },
+          "shore": {
+            "avg_fps": 124.5084934115216,
+            "frames": 996,
+            "low_1pct_fps": 65.81926224522087,
+            "p95_ms": 14.271374702453612,
+            "seconds": 7.999454275846482,
+            "gpu_ms": 7.817753554348007
+          },
+          "submerged": {
+            "avg_fps": 142.86884766012454,
+            "frames": 1143,
+            "low_1pct_fps": 58.10944522968455,
+            "p95_ms": 13.744125366210938,
+            "seconds": 8.000344502806664,
+            "gpu_ms": 5.567602245694911
+          }
+        },
+        "flight": {
+          "avg_fps": 127.07777869125076,
+          "frames": 1525,
+          "low_1pct_fps": 61.82364401171096,
+          "p95_ms": 13.849082946777344,
+          "seconds": 12.000524526834488,
+          "gpu_ms": 7.603521112227862
+        },
+        "columns_received": 190
+      },
+      "ultra": {
+        "archive": {
+          "file": "aurora-ultra-0.10.1-rc.1.hshader",
+          "sha256": "d7ba11b0fd4f2f27544e604aa48b7880e3f37389cc58669b223f777a13071c5d"
+        },
+        "stationary": {
+          "forest": {
+            "avg_fps": 126.18510550810322,
+            "frames": 1010,
+            "low_1pct_fps": 63.108525544918365,
+            "p95_ms": 14.09404182434082,
+            "seconds": 8.00411424100399,
+            "gpu_ms": 7.535716546867061
+          },
+          "shore": {
+            "avg_fps": 103.73687450802989,
+            "frames": 830,
+            "low_1pct_fps": 60.48194085603177,
+            "p95_ms": 13.480000495910645,
+            "seconds": 8.001012214183808,
+            "gpu_ms": 9.62334067907678
+          },
+          "submerged": {
+            "avg_fps": 140.49227074213977,
+            "frames": 1125,
+            "low_1pct_fps": 66.03732545166595,
+            "p95_ms": 11.983208656311035,
+            "seconds": 8.007557953596114,
+            "gpu_ms": 6.089736880408393
+          }
+        },
+        "flight": {
+          "avg_fps": 103.20972814449756,
+          "frames": 1239,
+          "low_1pct_fps": 57.541411997379136,
+          "p95_ms": 13.89283275604248,
+          "seconds": 12.004682332515715,
+          "gpu_ms": 9.643493880178776
+        },
+        "columns_received": 190
+      }
+    }
+  },
+  "shader_bundle_sha256": "2bd977e61dfe28707dce9dce196862b97e167590ad954840e256323acf94904f",
+  "engine": {
+    "upstream": "1f3ccb0fc3e593a6fe3a3c7da76d8e3d620e5b6d",
+    "source_tree": "e1767ef330e926e7db08c5e618937e61038bcc97",
+    "shader_api": "0.1-aurora-hdr.1",
+    "clean_build": {
+      "source": "new checkout reconstructed by the source kit from the pinned upstream commit",
+      "profile": "fast",
+      "rustc": "1.96.1",
+      "arch": "arm64-apple-darwin",
+      "cargo_locked": true,
+      "fresh_target": true,
+      "offline_dependency_cache": true,
+      "result": "success"
+    }
+  },
+  "limitations": [
+    "Short tests in one seed on one Mac. Frame pacing varies across display modes and scenes.",
+    "The 60 FPS check applies to the measured rainy shoreline. Some separate underwater or traversal intervals fell below 60 for 1% low.",
+    "Visual verdict is from live observation of two continuous turns, not a per-pixel temporal comparison."
+  ]
+}

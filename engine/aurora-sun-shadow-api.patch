@@ -1,0 +1,1020 @@
+From 9855d67a8c80a016c2fda90221bf0a31570d2243 Mon Sep 17 00:00:00 2001
+From: "Laze ." <laze.@MacBook-Pro-50.local>
+Date: Fri, 30 Oct 2026 14:05:58 -0400
+Subject: [PATCH] Add opt-in native sunlight depth map for Aurora
+
+Render opaque and cutout terrain from a stabilized solar camera, expose filtered material visibility through the local shadow.1 API, and preserve the water.3 contract and previous API lines.
+
+Co-Authored-By: Codex <noreply@openai.com>
+---
+ crates/horizon-client-render/src/gfx.rs       |  58 +++-
+ .../src/gfx/native_material.rs                |  32 +-
+ .../src/gfx/native_shadow.rs                  | 267 ++++++++++++++++
+ .../src/gfx/native_shadow.wgsl                |  17 +
+ .../src/gfx/native_shadow_tests.rs            | 293 ++++++++++++++++++
+ crates/horizon-shader-api/src/check.rs        |   5 +-
+ crates/horizon-shader-api/src/manifest.rs     |  17 +-
+ crates/horizon-shader-api/src/stages.rs       |   5 +-
+ crates/horizon-shader-api/src/sun_shadow.wgsl |  31 ++
+ crates/horizon-shader-api/tests/check.rs      |  27 ++
+ docs/api/aurora-sun-shadows.md                |  45 +++
+ 11 files changed, 788 insertions(+), 9 deletions(-)
+ create mode 100644 crates/horizon-client-render/src/gfx/native_shadow.rs
+ create mode 100644 crates/horizon-client-render/src/gfx/native_shadow.wgsl
+ create mode 100644 crates/horizon-client-render/src/gfx/native_shadow_tests.rs
+ create mode 100644 crates/horizon-shader-api/src/sun_shadow.wgsl
+ create mode 100644 docs/api/aurora-sun-shadows.md
+
+diff --git a/crates/horizon-client-render/src/gfx.rs b/crates/horizon-client-render/src/gfx.rs
+index 8dc00f2..66c4a67 100644
+--- a/crates/horizon-client-render/src/gfx.rs
++++ b/crates/horizon-client-render/src/gfx.rs
+@@ -81,6 +81,7 @@ mod native_material;
+ mod native_pack;
+ mod native_post;
+ mod native_scene;
++mod native_shadow;
+ mod native_sky;
+ mod occlusion;
+ mod pack_atlas;
+@@ -3977,7 +3978,14 @@ impl Renderer {
+             .as_ref()
+             .and_then(|p| p.1.as_ref())
+             .filter(|_| !frame.title)
+-            .and_then(|p| p.shadow_view(frame));
++            .and_then(|p| p.shadow_view(frame))
++            .or_else(|| {
++                self.native
++                    .as_ref()
++                    .and_then(|n| n.material.as_ref())
++                    .and_then(|m| m.shadow.as_ref())
++                    .and_then(|_| native_shadow::view(frame))
++            });
+         let mut shadow_visible = std::mem::take(&mut self.shadow_visible);
+         shadow_visible.clear();
+         if let Some(v) = &shadow_view {
+@@ -4748,6 +4756,9 @@ impl Renderer {
+             native
+                 .frame
+                 .write(&self.queue, frame, size, native_scene.then_some(jittered));
++            if let Some(shadow) = native.material.as_ref().and_then(|m| m.shadow.as_ref()) {
++                shadow.prepare(&self.queue, frame);
++            }
+             if let Some(scene) = native.material.as_mut().and_then(|m| m.scene.as_mut()) {
+                 scene.prepare(&self.device, &native.frame, (world_view, world_depth), size);
+             }
+@@ -4757,6 +4768,46 @@ impl Renderer {
+                     native.sky.is_some() && t.recording() && sky_visible && frame.skybox;
+             }
+         }
++        // Own depth target and uniform-only caster group: never sample the map being written.
++        if !frame.title
++            && let Some(shadow) = self
++                .native
++                .as_ref()
++                .and_then(|n| n.material.as_ref())
++                .and_then(|m| m.shadow.as_ref())
++        {
++            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
++                label: Some("Aurora sunlight terrain"),
++                color_attachments: &[],
++                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
++                    view: &shadow.depth,
++                    depth_ops: Some(wgpu::Operations {
++                        load: wgpu::LoadOp::Clear(1.0),
++                        store: wgpu::StoreOp::Store,
++                    }),
++                    stencil_ops: None,
++                }),
++                ..Default::default()
++            });
++            if native_shadow::view(frame).is_some() {
++                pass.set_pipeline(&shadow.pipeline);
++                pass.set_bind_group(0, &self.group, &[]);
++                pass.set_bind_group(2, &shadow.caster, &[]);
++                pass.set_vertex_buffer(1, self.instances.slice(..));
++                pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
++                // Draw the caster list directly even when main terrain uses flat draws.
++                let mut page = None;
++                for i in shadow_first as usize..(shadow_first + shadow_solid) as usize {
++                    let (p, _) = self.draw_pages[i];
++                    if page != Some(p) {
++                        pass.set_vertex_buffer(0, self.arena.buffer(p).slice(..));
++                        page = Some(p);
++                    }
++                    let d = self.draws[i];
++                    pass.draw_indexed(d[2]..d[2] + d[0], d[3] as i32, d[4]..d[4] + 1);
++                }
++            }
++        }
+         if native_sky_pass
+             && let Some(native) = &mut self.native
+             && let Some(sky) = &native.sky
+@@ -4800,7 +4851,10 @@ impl Renderer {
+         let translucent_pipeline = material.map_or(&self.translucent, |(m, _)| &m.translucent);
+         let pack_flat = material.and_then(|(m, _)| m.flat.as_ref());
+         let pack_frame = |pass: &mut wgpu::RenderPass<'_>| {
+-            if let Some((_, group)) = material {
++            if let Some((m, group)) = material {
++                if let Some(shadow) = &m.shadow {
++                    pass.set_bind_group(2, &shadow.receiver, &[]);
++                }
+                 pass.set_bind_group(horizon_shader_api::stages::GROUP, group, &[]);
+             }
+         };
+diff --git a/crates/horizon-client-render/src/gfx/native_material.rs b/crates/horizon-client-render/src/gfx/native_material.rs
+index 706f752..7fe1bb3 100644
+--- a/crates/horizon-client-render/src/gfx/native_material.rs
++++ b/crates/horizon-client-render/src/gfx/native_material.rs
+@@ -101,6 +101,7 @@ pub struct TerrainShape<'a> {
+ /// renderer's instanced draws and, where they run, its flat ones.
+ pub struct NativeMaterial {
+     pub scene: Option<NativeScene>,
++    pub shadow: Option<super::native_shadow::NativeShadow>,
+     pub solid: wgpu::RenderPipeline,
+     pub translucent: wgpu::RenderPipeline,
+     pub flat: Option<(wgpu::RenderPipeline, wgpu::RenderPipeline)>,
+@@ -108,7 +109,7 @@ pub struct NativeMaterial {
+ 
+ /// terrain.wgsl's terrain section (its globals, bindings, sampling, lighting and fog), with
+ /// every name it declares prefixed.
+-fn vanilla_terrain() -> String {
++pub(super) fn vanilla_terrain() -> String {
+     prefixed(
+         section(TERRAIN, "struct Globals {", "// Sky (SkyRenderer)"),
+         PREFIX,
+@@ -171,6 +172,9 @@ impl NativeMaterial {
+         ];
+         constants.extend(sprite_names.into_iter().zip(shape.sprites));
+         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
++        let shadow = stage
++            .sun_shadow
++            .then(|| super::native_shadow::NativeShadow::new(device, shape));
+         let scene = stage
+             .scene_snapshot
+             .then(|| NativeScene::new(device, shape.format));
+@@ -183,6 +187,7 @@ impl NativeMaterial {
+                 Default::default();
+             groups[0] = Some(shape.globals);
+             groups[1] = flat;
++            groups[2] = shadow.as_ref().map(|s| &s.layout);
+             groups[GROUP as usize] = Some(scene.as_ref().map_or(&frame.layout, |s| &s.layout));
+             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                 label: Some("Native shader pack terrain"),
+@@ -283,6 +288,7 @@ impl NativeMaterial {
+         }
+         Ok(Self {
+             scene,
++            shadow,
+             solid,
+             translucent,
+             flat,
+@@ -381,4 +387,28 @@ mod tests {
+         .validate(&module)
+         .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&shader_source(&stage))));
+     }
++
++    #[test]
++    fn sunlight_material_composes_with_real_terrain_entries() {
++        let manifest = "schema=1\nid=\"t\"\nname=\"T\"\nversion=\"1\"\napi=\"0.1-aurora-shadow.1\"\n[material]\nfile=\"m.wgsl\"\n[[post]]\nfile=\"p.wgsl\"\n";
++        let material = "fn material(i: MaterialInput) -> Surface {
++            let n=normalize(cross(dpdx(i.position),dpdy(i.position)));
++            let c=textureSampleLevel(pre_translucent_color,scene_sampler,i.screen_uv,0.0);
++            return Surface(c * sun_visibility(i.position,n),i.translucent); }";
++        let post = "fn post(i: PostInput) -> vec4<f32> { return i.color; }";
++        let files = [(MANIFEST, manifest), ("m.wgsl", material), ("p.wgsl", post)]
++            .map(|(k, v)| (k.into(), v.as_bytes().to_vec()))
++            .into();
++        let stage = check(&Pack::from_files(files).unwrap())
++            .unwrap()
++            .stages
++            .remove(0);
++        let module = module(&stage).unwrap();
++        naga::valid::Validator::new(
++            naga::valid::ValidationFlags::all(),
++            naga::valid::Capabilities::all(),
++        )
++        .validate(&module)
++        .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&shader_source(&stage))));
++    }
+ }
+diff --git a/crates/horizon-client-render/src/gfx/native_shadow.rs b/crates/horizon-client-render/src/gfx/native_shadow.rs
+new file mode 100644
+index 0000000..ed95989
+--- /dev/null
++++ b/crates/horizon-client-render/src/gfx/native_shadow.rs
+@@ -0,0 +1,267 @@
++//! Aurora shadow.1: one texel-stabilized orthographic map for opaque/cutout terrain.
++//! Camera-independent caster visibility; no entities, translucent casters or LOD meshes.
++use super::{
++    Frame,
++    native_material::{TerrainShape, vanilla_terrain},
++    pack_post::ShadowView,
++};
++use glam::{DMat4, DVec3, Mat4, Vec3};
++
++pub(super) const SIZE: u32 = 2048;
++const RADIUS: f32 = 48.0;
++const CASTER_DISTANCE: f32 = 96.0;
++
++#[repr(C)]
++#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
++struct Uniform {
++    matrix: [[f32; 4]; 4],
++    parameters: [f32; 4],
++}
++
++pub struct NativeShadow {
++    pub layout: wgpu::BindGroupLayout,
++    pub receiver: wgpu::BindGroup,
++    pub caster: wgpu::BindGroup,
++    pub pipeline: wgpu::RenderPipeline,
++    pub depth: wgpu::TextureView,
++    uniform: wgpu::Buffer,
++}
++
++// Only x/y snap: preserving continuous depth avoids depth jumps during translation.
++fn matrix(camera: DVec3, light: Vec3) -> Mat4 {
++    let rotation = DMat4::look_to_rh(DVec3::ZERO, -light.as_dvec3(), DVec3::Z);
++    let at = rotation.transform_vector3(camera);
++    let step = f64::from(2.0 * RADIUS / SIZE as f32);
++    let offset = DVec3::new(
++        at.x - (at.x / step).floor() * step,
++        at.y - (at.y / step).floor() * step,
++        -128.0,
++    );
++    Mat4::orthographic_rh(-RADIUS, RADIUS, -RADIUS, RADIUS, 0.1, 256.0)
++        * (DMat4::from_translation(offset) * rotation).as_mat4()
++}
++
++pub(super) fn view(frame: &Frame) -> Option<ShadowView> {
++    let a = frame.sky.sun_angle.to_radians();
++    let light = Vec3::new(-a.sin(), a.cos(), 0.0);
++    if frame.title || frame.nether_lighting || frame.end_sky || light.y <= 0.05 {
++        return None;
++    }
++    Some(ShadowView {
++        cull: matrix(frame.camera, light),
++        light,
++        distance: Some(CASTER_DISTANCE),
++    })
++}
++
++impl NativeShadow {
++    pub fn new(device: &wgpu::Device, shape: &TerrainShape<'_>) -> Self {
++        let uniform_entry = wgpu::BindGroupLayoutEntry {
++            binding: 2,
++            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
++            ty: wgpu::BindingType::Buffer {
++                ty: wgpu::BufferBindingType::Uniform,
++                has_dynamic_offset: false,
++                min_binding_size: wgpu::BufferSize::new(80),
++            },
++            count: None,
++        };
++        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++            label: Some("Aurora sunlight receiver"),
++            entries: &[
++                super::native_post::texture_entry(0, wgpu::TextureSampleType::Depth),
++                wgpu::BindGroupLayoutEntry {
++                    binding: 1,
++                    visibility: wgpu::ShaderStages::FRAGMENT,
++                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
++                    count: None,
++                },
++                uniform_entry,
++            ],
++        });
++        let caster_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++            label: Some("Aurora sunlight caster"),
++            entries: &[uniform_entry],
++        });
++        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
++            label: Some("Aurora sun matrix"),
++            size: 80,
++            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
++            mapped_at_creation: false,
++        });
++        let depth = device
++            .create_texture(&wgpu::TextureDescriptor {
++                label: Some("Aurora sun depth"),
++                size: wgpu::Extent3d {
++                    width: SIZE,
++                    height: SIZE,
++                    depth_or_array_layers: 1,
++                },
++                mip_level_count: 1,
++                sample_count: 1,
++                dimension: wgpu::TextureDimension::D2,
++                format: wgpu::TextureFormat::Depth32Float,
++                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
++                    | wgpu::TextureUsages::TEXTURE_BINDING,
++                view_formats: &[],
++            })
++            .create_view(&Default::default());
++        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
++            label: Some("Aurora PCF"),
++            compare: Some(wgpu::CompareFunction::LessEqual),
++            mag_filter: wgpu::FilterMode::Linear,
++            min_filter: wgpu::FilterMode::Linear,
++            ..Default::default()
++        });
++        let receiver = device.create_bind_group(&wgpu::BindGroupDescriptor {
++            label: Some("Aurora sunlight receiver"),
++            layout: &layout,
++            entries: &[
++                wgpu::BindGroupEntry {
++                    binding: 0,
++                    resource: wgpu::BindingResource::TextureView(&depth),
++                },
++                wgpu::BindGroupEntry {
++                    binding: 1,
++                    resource: wgpu::BindingResource::Sampler(&sampler),
++                },
++                wgpu::BindGroupEntry {
++                    binding: 2,
++                    resource: uniform.as_entire_binding(),
++                },
++            ],
++        });
++        let caster = device.create_bind_group(&wgpu::BindGroupDescriptor {
++            label: Some("Aurora sunlight caster"),
++            layout: &caster_layout,
++            entries: &[wgpu::BindGroupEntry {
++                binding: 2,
++                resource: uniform.as_entire_binding(),
++            }],
++        });
++        let source = format!(
++            "{}\n{}",
++            vanilla_terrain(),
++            include_str!("native_shadow.wgsl")
++        );
++        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
++            label: Some("Aurora sun casters"),
++            source: wgpu::ShaderSource::Wgsl(source.into()),
++        });
++        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
++            label: Some("Aurora sun casters"),
++            bind_group_layouts: &[Some(shape.globals), None, Some(&caster_layout)],
++            ..Default::default()
++        });
++        let constants = [
++            ("horizon_terrain_SPRITE_ARRAYS", shape.sprites[0]),
++            ("horizon_terrain_SPRITE_SPLIT", shape.sprites[1]),
++        ];
++        let options = wgpu::PipelineCompilationOptions {
++            constants: &constants,
++            ..Default::default()
++        };
++        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
++            label: Some("Aurora sun terrain depth"),
++            layout: Some(&pipeline_layout),
++            vertex: wgpu::VertexState {
++                module: &module,
++                entry_point: Some("vs_sun"),
++                compilation_options: options.clone(),
++                buffers: &[
++                    Some(wgpu::VertexBufferLayout {
++                        array_stride: size_of::<super::TerrainVertex>() as u64,
++                        step_mode: wgpu::VertexStepMode::Vertex,
++                        attributes: &super::TERRAIN_ATTRIBUTES,
++                    }),
++                    Some(wgpu::VertexBufferLayout {
++                        array_stride: 16,
++                        step_mode: wgpu::VertexStepMode::Instance,
++                        attributes: &wgpu::vertex_attr_array![5=>Float32x4],
++                    }),
++                ],
++            },
++            primitive: wgpu::PrimitiveState {
++                cull_mode: None,
++                ..Default::default()
++            },
++            depth_stencil: Some(wgpu::DepthStencilState {
++                format: wgpu::TextureFormat::Depth32Float,
++                depth_write_enabled: Some(true),
++                depth_compare: Some(wgpu::CompareFunction::LessEqual),
++                stencil: Default::default(),
++                bias: wgpu::DepthBiasState {
++                    constant: 2,
++                    slope_scale: 2.0,
++                    clamp: 0.0,
++                },
++            }),
++            multisample: Default::default(),
++            fragment: Some(wgpu::FragmentState {
++                module: &module,
++                entry_point: Some("fs_sun"),
++                compilation_options: options,
++                targets: &[],
++            }),
++            multiview_mask: None,
++            cache: None,
++        });
++        Self {
++            layout,
++            receiver,
++            caster,
++            pipeline,
++            depth,
++            uniform,
++        }
++    }
++
++    pub(super) fn prepare(&self, queue: &wgpu::Queue, frame: &Frame) {
++        let view = view(frame);
++        let data = Uniform {
++            matrix: view
++                .as_ref()
++                .map_or(Mat4::IDENTITY, |v| v.cull)
++                .to_cols_array_2d(),
++            parameters: [
++                1.0 / SIZE as f32,
++                32.0,
++                44.0,
++                if view.is_some() { 1.0 } else { 0.0 },
++            ],
++        };
++        queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&data));
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn projection_depth_and_texel_stability() {
++        let light = Vec3::new(-0.6, 0.8, 0.0);
++        let camera = DVec3::new(100000.013, 64.021, -200000.027);
++        let m = matrix(camera, light);
++        let p = m.project_point3(Vec3::ZERO);
++        let toward = m.project_point3(light * 10.0);
++        assert!(p.z > 0.0 && p.z < 1.0);
++        assert!(toward.z < p.z, "sunward caster must have smaller depth");
++        // Arbitrary camera translation changes a fixed world's UV by integer texels only.
++        let moved = camera + DVec3::new(0.013, 0.019, -0.011);
++        let q = matrix(moved, light).project_point3((camera - moved).as_vec3());
++        for d in [
++            (q.x - p.x) * SIZE as f32 * 0.5,
++            (q.y - p.y) * SIZE as f32 * 0.5,
++        ] {
++            assert!((d - d.round()).abs() < 0.001, "unstable texel delta {d}");
++        }
++        for angle in [0.0_f32, 45.0, 80.0] {
++            let a = angle.to_radians();
++            assert!(matrix(camera, Vec3::new(-a.sin(), a.cos(), 0.0)).is_finite());
++        }
++    }
++}
++
++#[cfg(test)]
++#[path = "native_shadow_tests.rs"]
++mod gpu_tests;
+diff --git a/crates/horizon-client-render/src/gfx/native_shadow.wgsl b/crates/horizon-client-render/src/gfx/native_shadow.wgsl
+new file mode 100644
+index 0000000..0fbd1d3
+--- /dev/null
++++ b/crates/horizon-client-render/src/gfx/native_shadow.wgsl
+@@ -0,0 +1,17 @@
++struct AuroraSun { matrix: mat4x4<f32>, parameters: vec4<f32>, }
++@group(2) @binding(2) var<uniform> aurora_sun: AuroraSun;
++struct SunVertex {
++    @builtin(position) clip: vec4<f32>,
++    @location(0) uv: vec2<f32>,
++    @location(1) @interpolate(flat) layer: u32,
++}
++@vertex fn vs_sun(@location(0) position: vec3<f32>, @location(1) uv: vec2<u32>,
++    @location(2) layer: u32, @location(3) color: vec4<f32>, @location(4) light: vec2<u32>,
++    @location(5) origin: vec4<f32>) -> SunVertex {
++    return SunVertex(aurora_sun.matrix * vec4<f32>(position + origin.xyz, 1.0),
++        horizon_terrain_terrain_uv(uv, origin.w), layer);
++}
++@fragment fn fs_sun(input: SunVertex) {
++    let alpha = horizon_terrain_sprite(input.uv, input.layer & 0x7fffu).a;
++    if alpha < 0.5 && (input.layer & 0x8000u) == 0u { discard; }
++}
+diff --git a/crates/horizon-client-render/src/gfx/native_shadow_tests.rs b/crates/horizon-client-render/src/gfx/native_shadow_tests.rs
+new file mode 100644
+index 0000000..1d8777d
+--- /dev/null
++++ b/crates/horizon-client-render/src/gfx/native_shadow_tests.rs
+@@ -0,0 +1,293 @@
++//! Real caster → comparison-sampler receiver: cutout must transmit, opaque must occlude.
++use super::*;
++use bytemuck::Zeroable;
++use wgpu::util::DeviceExt;
++
++#[test]
++fn cutout_caster_and_receiver_on_gpu() {
++    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
++    let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
++        assert!(
++            std::env::var_os("AURORA_REQUIRE_GPU").is_none(),
++            "Metal adapter required for the Aurora preview"
++        );
++        eprintln!("SKIP sunlight GPU test: no adapter");
++        return;
++    };
++    eprintln!("Sunlight GPU: {:?}", adapter.get_info());
++    let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
++    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
++    let vf = wgpu::ShaderStages::VERTEX_FRAGMENT;
++    let entries: Vec<_> = (0..12)
++        .map(|binding| wgpu::BindGroupLayoutEntry {
++            binding,
++            visibility: vf,
++            count: None,
++            ty: match binding {
++                0 => wgpu::BindingType::Buffer {
++                    ty: wgpu::BufferBindingType::Uniform,
++                    has_dynamic_offset: false,
++                    min_binding_size: None,
++                },
++                2 | 4 => wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
++                b => wgpu::BindingType::Texture {
++                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
++                    view_dimension: if b == 3 {
++                        wgpu::TextureViewDimension::D2
++                    } else {
++                        wgpu::TextureViewDimension::D2Array
++                    },
++                    multisampled: false,
++                },
++            },
++        })
++        .collect();
++    let globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++        label: None,
++        entries: &entries,
++    });
++    let shape = TerrainShape {
++        globals: &globals_layout,
++        flat: None,
++        sprites: [1.0, 2048.0],
++        format: wgpu::TextureFormat::Rgba8Unorm,
++    };
++    let shadow = NativeShadow::new(&device, &shape);
++    let data = Uniform {
++        matrix: Mat4::IDENTITY.to_cols_array_2d(),
++        parameters: [1.0 / SIZE as f32, 32.0, 44.0, 1.0],
++    };
++    queue.write_buffer(&shadow.uniform, 0, bytemuck::bytes_of(&data));
++    let texture = device.create_texture(&wgpu::TextureDescriptor {
++        label: None,
++        size: wgpu::Extent3d {
++            width: 2,
++            height: 1,
++            depth_or_array_layers: 1,
++        },
++        mip_level_count: 1,
++        sample_count: 1,
++        dimension: wgpu::TextureDimension::D2,
++        format: wgpu::TextureFormat::Rgba8Unorm,
++        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
++        view_formats: &[],
++    });
++    queue.write_texture(
++        texture.as_image_copy(),
++        &[255, 255, 255, 255, 255, 255, 255, 0],
++        wgpu::TexelCopyBufferLayout {
++            offset: 0,
++            bytes_per_row: Some(8),
++            rows_per_image: None,
++        },
++        texture.size(),
++    );
++    let array = texture.create_view(&wgpu::TextureViewDescriptor {
++        dimension: Some(wgpu::TextureViewDimension::D2Array),
++        ..Default::default()
++    });
++    let flat = texture.create_view(&Default::default());
++    let sampler = device.create_sampler(&Default::default());
++    let globals = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
++        label: None,
++        contents: bytemuck::bytes_of(&super::super::Globals::zeroed()),
++        usage: wgpu::BufferUsages::UNIFORM,
++    });
++    let bindings: Vec<_> = (0..12)
++        .map(|binding| wgpu::BindGroupEntry {
++            binding,
++            resource: match binding {
++                0 => globals.as_entire_binding(),
++                2 | 4 => wgpu::BindingResource::Sampler(&sampler),
++                3 => wgpu::BindingResource::TextureView(&flat),
++                _ => wgpu::BindingResource::TextureView(&array),
++            },
++        })
++        .collect();
++    let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
++        label: None,
++        layout: &globals_layout,
++        entries: &bindings,
++    });
++    let points = [
++        ([-0.8, -0.8, 0.25], [0, 32768]),
++        ([0.8, -0.8, 0.25], [32768, 32768]),
++        ([0.8, 0.8, 0.25], [32768, 0]),
++        ([-0.8, 0.8, 0.25], [0, 0]),
++    ];
++    let vertices: Vec<super::super::TerrainVertex> = points
++        .into_iter()
++        .map(|(pos, uv)| {
++            let mut v = super::super::TerrainVertex::zeroed();
++            v.pos = pos;
++            v.uv = uv;
++            v
++        })
++        .collect();
++    let buffer = |data: &[u8], usage| {
++        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
++            label: None,
++            contents: data,
++            usage,
++        })
++    };
++    let vertices = buffer(bytemuck::cast_slice(&vertices), wgpu::BufferUsages::VERTEX);
++    let origins = buffer(
++        bytemuck::cast_slice(&[0.0_f32, 0.0, 0.0, 1.0 / 32768.0]),
++        wgpu::BufferUsages::VERTEX,
++    );
++    let indices = buffer(
++        bytemuck::cast_slice(&[0u32, 1, 2, 0, 2, 3]),
++        wgpu::BufferUsages::INDEX,
++    );
++    let frame = super::super::native_post::NativeFrame::new(&device);
++    let mut inputs = horizon_shader_api::Frame::zeroed();
++    inputs.sun_direction = [0.0, 1.0, 0.0];
++    queue.write_buffer(&frame.buffer, 0, bytemuck::bytes_of(&inputs));
++    let source = horizon_shader_api::StageKind::Material.prelude_for("0.1-aurora-shadow.1")
++        + "
++        @vertex fn vs(@builtin(vertex_index) i:u32)->@builtin(position) vec4<f32> {
++            let p=vec2<f32>(f32((i<<1u)&2u),f32(i&2u)); return vec4(p*2.0-1.0,0.0,1.0); }
++        @fragment fn fs(@builtin(position) p:vec4<f32>)->@location(0) vec4<f32> {
++            let x=p.x/4.0*2.0-1.0;
++            let v=sun_visibility(vec3<f32>(x,0.0,0.75),vec3<f32>(0.0,0.0,1.0));
++            return vec4<f32>(v,v,v,1.0); }";
++    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
++        label: None,
++        source: wgpu::ShaderSource::Wgsl(source.into()),
++    });
++    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
++        label: None,
++        bind_group_layouts: &[None, None, Some(&shadow.layout), Some(&frame.layout)],
++        ..Default::default()
++    });
++    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
++        label: None,
++        layout: Some(&layout),
++        vertex: wgpu::VertexState {
++            module: &module,
++            entry_point: Some("vs"),
++            compilation_options: Default::default(),
++            buffers: &[],
++        },
++        primitive: Default::default(),
++        depth_stencil: None,
++        multisample: Default::default(),
++        fragment: Some(wgpu::FragmentState {
++            module: &module,
++            entry_point: Some("fs"),
++            compilation_options: Default::default(),
++            targets: &[Some(wgpu::ColorTargetState {
++                format: wgpu::TextureFormat::Rgba8Unorm,
++                blend: None,
++                write_mask: wgpu::ColorWrites::ALL,
++            })],
++        }),
++        multiview_mask: None,
++        cache: None,
++    });
++    let target = device.create_texture(&wgpu::TextureDescriptor {
++        label: None,
++        size: wgpu::Extent3d {
++            width: 4,
++            height: 1,
++            depth_or_array_layers: 1,
++        },
++        mip_level_count: 1,
++        sample_count: 1,
++        dimension: wgpu::TextureDimension::D2,
++        format: wgpu::TextureFormat::Rgba8Unorm,
++        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
++        view_formats: &[],
++    });
++    let target_view = target.create_view(&Default::default());
++    for enabled in [true, false] {
++        let mut data = data;
++        data.parameters[3] = if enabled { 1.0 } else { 0.0 };
++        queue.write_buffer(&shadow.uniform, 0, bytemuck::bytes_of(&data));
++        let mut encoder = device.create_command_encoder(&Default::default());
++        {
++            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
++                label: None,
++                color_attachments: &[],
++                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
++                    view: &shadow.depth,
++                    depth_ops: Some(wgpu::Operations {
++                        load: wgpu::LoadOp::Clear(1.0),
++                        store: wgpu::StoreOp::Store,
++                    }),
++                    stencil_ops: None,
++                }),
++                ..Default::default()
++            });
++            pass.set_pipeline(&shadow.pipeline);
++            pass.set_bind_group(0, &group, &[]);
++            pass.set_bind_group(2, &shadow.caster, &[]);
++            pass.set_vertex_buffer(0, vertices.slice(..));
++            pass.set_vertex_buffer(1, origins.slice(..));
++            pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
++            pass.draw_indexed(0..6, 0, 0..1);
++        }
++        {
++            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
++                label: None,
++                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
++                    view: &target_view,
++                    resolve_target: None,
++                    depth_slice: None,
++                    ops: wgpu::Operations {
++                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
++                        store: wgpu::StoreOp::Store,
++                    },
++                })],
++                ..Default::default()
++            });
++            pass.set_pipeline(&pipeline);
++            pass.set_bind_group(2, &shadow.receiver, &[]);
++            pass.set_bind_group(3, &frame.group, &[]);
++            pass.draw(0..3, 0..1);
++        }
++        let read = device.create_buffer(&wgpu::BufferDescriptor {
++            label: None,
++            size: 256,
++            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
++            mapped_at_creation: false,
++        });
++        encoder.copy_texture_to_buffer(
++            target.as_image_copy(),
++            wgpu::TexelCopyBufferInfo {
++                buffer: &read,
++                layout: wgpu::TexelCopyBufferLayout {
++                    offset: 0,
++                    bytes_per_row: Some(256),
++                    rows_per_image: None,
++                },
++            },
++            target.size(),
++        );
++        queue.submit([encoder.finish()]);
++        let (send, recv) = std::sync::mpsc::channel();
++        read.slice(..).map_async(wgpu::MapMode::Read, move |r| {
++            send.send(r).unwrap();
++        });
++        device
++            .poll(wgpu::PollType::Wait {
++                submission_index: None,
++                timeout: None,
++            })
++            .unwrap();
++        recv.recv().unwrap().unwrap();
++        let bytes = read.slice(..).get_mapped_range().unwrap();
++        for i in 0..4 {
++            let want = if enabled && i < 2 { 0 } else { 255 };
++            assert!(
++                (i32::from(bytes[i * 4]) - want).abs() <= 2,
++                "enabled={enabled} pixel={i}: {:?}",
++                &bytes[..16]
++            );
++        }
++        drop(bytes);
++        read.unmap();
++    }
++    assert!(pollster::block_on(scope.pop()).is_none());
++}
+diff --git a/crates/horizon-shader-api/src/check.rs b/crates/horizon-shader-api/src/check.rs
+index 38c2252..7060c56 100644
+--- a/crates/horizon-shader-api/src/check.rs
++++ b/crates/horizon-shader-api/src/check.rs
+@@ -57,6 +57,7 @@ pub struct CheckedStage {
+     pub kind: StageKind,
+     /// The opt-in water.2 material stage needs a pre-translucent scene snapshot.
+     pub scene_snapshot: bool,
++    pub sun_shadow: bool,
+     pub file: String,
+     /// The manifest's name for it, else its file.
+     pub label: String,
+@@ -120,7 +121,7 @@ pub fn check(pack: &Pack) -> Result<Report, Vec<Problem>> {
+     if problems.is_empty() {
+         Ok(Report {
+             stages: checked,
+-            water_environment: m.api == crate::manifest::AURORA_IMMERSION_API,
++            water_environment: crate::manifest::has_water_environment(&m.api),
+         })
+     } else {
+         Err(problems)
+@@ -175,6 +176,8 @@ pub fn check_stage(pack: &Pack, kind: StageKind, file: &str) -> Result<CheckedSt
+     }
+     Ok(CheckedStage {
+         kind,
++        sun_shadow: kind == StageKind::Material
++            && pack.manifest.api == crate::manifest::AURORA_SHADOW_API,
+         scene_snapshot: kind == StageKind::Material
+             && crate::manifest::has_scene_snapshot(&pack.manifest.api),
+         file: file.to_owned(),
+diff --git a/crates/horizon-shader-api/src/manifest.rs b/crates/horizon-shader-api/src/manifest.rs
+index bef52dd..ae20beb 100644
+--- a/crates/horizon-shader-api/src/manifest.rs
++++ b/crates/horizon-shader-api/src/manifest.rs
+@@ -14,8 +14,16 @@ pub const AURORA_WATER_API: &str = "0.1-aurora-water.1";
+ pub const AURORA_SCENE_API: &str = "0.1-aurora-water.2";
+ /// Continuous water immersion; the pack owns water fog in a required post stage.
+ pub const AURORA_IMMERSION_API: &str = "0.1-aurora-water.3";
++/// Local directional terrain shadow map, with the water.3 contract.
++pub const AURORA_SHADOW_API: &str = "0.1-aurora-shadow.1";
++pub fn has_water_environment(api: &str) -> bool {
++    matches!(api, AURORA_IMMERSION_API | AURORA_SHADOW_API)
++}
+ pub fn has_scene_snapshot(api: &str) -> bool {
+-    matches!(api, AURORA_SCENE_API | AURORA_IMMERSION_API)
++    matches!(
++        api,
++        AURORA_SCENE_API | AURORA_IMMERSION_API | AURORA_SHADOW_API
++    )
+ }
+ /// Full-screen passes a pack may chain.
+ pub const MAX_POST_PASSES: usize = 8;
+@@ -152,9 +160,10 @@ impl Manifest {
+             && raw.api != AURORA_WATER_API
+             && raw.api != AURORA_SCENE_API
+             && raw.api != AURORA_IMMERSION_API
++            && raw.api != AURORA_SHADOW_API
+         {
+             return Err(err(format!(
+-                "written for shader API {}; this Horizon serves {API}, {AURORA_WATER_API}, {AURORA_SCENE_API} and {AURORA_IMMERSION_API}",
++                "written for shader API {}; this Horizon serves {API}, {AURORA_WATER_API}, {AURORA_SCENE_API} {AURORA_IMMERSION_API} and {AURORA_SHADOW_API}",
+                 raw.api
+             )));
+         }
+@@ -174,9 +183,9 @@ impl Manifest {
+                 "no stage: give it a [sky], a [material] or a [[post]]".into()
+             ));
+         }
+-        if raw.api == AURORA_IMMERSION_API && raw.post.is_empty() {
++        if has_water_environment(&raw.api) && raw.post.is_empty() {
+             return Err(err(
+-                "water.3 requires a post stage to compose underwater fog".into(),
++                "this API requires a post stage to compose underwater fog".into(),
+             ));
+         }
+         if raw.post.len() > MAX_POST_PASSES {
+diff --git a/crates/horizon-shader-api/src/stages.rs b/crates/horizon-shader-api/src/stages.rs
+index 33f893c..ccd95c4 100644
+--- a/crates/horizon-shader-api/src/stages.rs
++++ b/crates/horizon-shader-api/src/stages.rs
+@@ -222,7 +222,7 @@ impl StageKind {
+     /// water.2 changes only the material stage. Existing API lines retain their ABI.
+     pub fn prelude_for(self, api: &str) -> String {
+         let mut out = self.prelude();
+-        if api == crate::manifest::AURORA_IMMERSION_API {
++        if crate::manifest::has_water_environment(api) {
+             let frame = Frame::WGSL.wgsl();
+             out = out.replace(&frame, &frame.replacen("}\n",
+                 "    // x: continuous water coverage, y: water environment enabled; z/w reserved.\n    water: vec4<f32>,\n}\n", 1));
+@@ -240,6 +240,9 @@ impl StageKind {
+             );
+             out += SCENE_PRELUDE;
+         }
++        if self == StageKind::Material && api == crate::manifest::AURORA_SHADOW_API {
++            out += include_str!("sun_shadow.wgsl");
++        }
+         out
+     }
+ 
+diff --git a/crates/horizon-shader-api/src/sun_shadow.wgsl b/crates/horizon-shader-api/src/sun_shadow.wgsl
+new file mode 100644
+index 0000000..2a1d8b2
+--- /dev/null
++++ b/crates/horizon-shader-api/src/sun_shadow.wgsl
+@@ -0,0 +1,31 @@
++// shadow.1 material-only resources. Engine-owned group 2 is reserved for this extension.
++struct SunShadow {
++    matrix: mat4x4<f32>,
++    // map texel size, receiver fade start/end (blocks), enabled
++    parameters: vec4<f32>,
++}
++@group(2) @binding(0) var sun_shadow_depth: texture_depth_2d;
++@group(2) @binding(1) var sun_shadow_sampler: sampler_comparison;
++@group(2) @binding(2) var<uniform> sun_shadow: SunShadow;
++
++// Camera-relative position, geometric world normal; 1 means unoccluded sunlight.
++fn sun_visibility(position: vec3<f32>, normal: vec3<f32>) -> f32 {
++    if sun_shadow.parameters.w < 0.5 { return 1.0; }
++    let clip = sun_shadow.matrix * vec4<f32>(position, 1.0);
++    let uv = clip.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
++    let border = sun_shadow.parameters.x * 3.0;
++    if any(uv < vec2<f32>(border)) || any(uv > vec2<f32>(1.0 - border))
++        || clip.z <= 0.0 || clip.z >= 1.0 { return 1.0; }
++    let slope = 1.0 - abs(dot(normal, frame.sun_direction));
++    let reference = clip.z - (0.00015 + 0.0004 * slope);
++    var visibility = 0.0;
++    for (var y: i32 = -1; y <= 1; y += 1) {
++        for (var x: i32 = -1; x <= 1; x += 1) {
++            visibility += textureSampleCompareLevel(sun_shadow_depth, sun_shadow_sampler,
++                uv + vec2<f32>(f32(x), f32(y)) * sun_shadow.parameters.x, reference);
++        }
++    }
++    let edge = smoothstep(0.0, 0.08, min(min(uv.x, uv.y), min(1.0-uv.x, 1.0-uv.y)));
++    let range = 1.0 - smoothstep(sun_shadow.parameters.y, sun_shadow.parameters.z, length(position));
++    return mix(1.0, visibility / 9.0, edge * range);
++}
+diff --git a/crates/horizon-shader-api/tests/check.rs b/crates/horizon-shader-api/tests/check.rs
+index 615a768..d1f8b01 100644
+--- a/crates/horizon-shader-api/tests/check.rs
++++ b/crates/horizon-shader-api/tests/check.rs
+@@ -199,3 +199,30 @@ fn immersion_stages_translate_and_opt_in_only_on_water_three() {
+         }
+     }
+ }
++
++#[test]
++fn sun_shadow_is_opt_in_and_translates_for_metal() {
++    for api in ["0.1-aurora-water.3", "0.1-aurora-shadow.1"] {
++        let manifest = format!(
++            "schema=1\nid=\"t\"\nname=\"T\"\nversion=\"1\"\napi=\"{api}\"\n[material]\nfile=\"m.wgsl\"\n[[post]]\nfile=\"p.wgsl\"\n"
++        );
++        let material = "fn material(i: MaterialInput) -> Surface { let n=normalize(cross(dpdx(i.position),dpdy(i.position))); return Surface(vec4(vec3(sun_visibility(i.position,n)),1.0),false); }";
++        let post = "fn post(i: PostInput) -> vec4<f32> { return i.color; }";
++        let files = [
++            (MANIFEST, manifest.as_str()),
++            ("m.wgsl", material),
++            ("p.wgsl", post),
++        ]
++        .map(|(k, v)| (k.into(), v.as_bytes().to_vec()))
++        .into();
++        let result = check(&Pack::from_files(files).unwrap());
++        if api.ends_with("shadow.1") {
++            let r = result.unwrap();
++            assert!(r.water_environment);
++            assert!(r.stages[0].sun_shadow && r.stages[0].scene_snapshot);
++            assert!(!r.stages[1].sun_shadow);
++        } else {
++            assert!(result.is_err());
++        }
++    }
++}
+diff --git a/docs/api/aurora-sun-shadows.md b/docs/api/aurora-sun-shadows.md
+new file mode 100644
+index 0000000..c5bf3d5
+--- /dev/null
++++ b/docs/api/aurora-sun-shadows.md
+@@ -0,0 +1,45 @@
++# Local Aurora sunlight extension
++
++`0.1-aurora-shadow.1` extends the local water.3 contract. It is not an upstream
++Horizon API. Existing API lines retain their shaders, layouts and allocation behaviour.
++The extension requires a post stage, because it retains water.3 fog ownership.
++
++Only the material stage receives `sun_visibility(camera_relative_position, geometric_world_normal)`.
++Its result is 0..1, with 1 meaning sunlight is unoccluded. The pack decides how to
++combine it with sky light, block light, weather and status effects. A zero contrast
++option in the pack does not disable the engine's depth-map work.
++
++Material group 2 is engine-owned for this extension:
++
++| Binding | Resource |
++| --- | --- |
++| 0 | `texture_depth_2d` sunlight map |
++| 1 | comparison sampler, LessEqual, linear filtering |
++| 2 | 80-byte uniform: camera-relative matrix, texel size, fade start/end, enabled |
++
++Group 3 remains the water.3 frame and pre-translucent snapshot. Frame's memory
++layout is unchanged from water.3. Sky and post stages cannot sample the shadow map.
++The caster pass binds a separate group 2 holding only the matrix; it never binds
++the depth texture as input while writing it.
++
++The depth target is 2048² Depth32Float (16 MiB), standard 0..1 depth, cleared to 1.
++One orthographic projection spans 96 blocks across. Its x/y origin snaps to texels
++in double precision; the camera-relative matrix converts to f32 afterward.
++The light uses the same solar direction as the native shader Frame. Receivers fade
++between 32 and 44 blocks from the camera and at map borders. Casters are limited to
++96 blocks horizontally and to the light frustum; no guarantee for distant tall casters.
++Night, title screen, Nether and End disable reception and skip caster draws.
++The target is still cleared to avoid stale data. The pack fades reception near sunset.
++
++Caster selection uses the existing light-frustum section list, bypassing player
++frustum/occlusion. Direct instanced draws work with both main-terrain draw paths.
++Only solid/cutout terrain is drawn, with the same texture alpha threshold and opaque-leaf
++flag as the normal material pipeline. No entity, transparent, LOD or coloured shadows.
++Nine comparison samples soften edges; this is fixed PCF, not contact-hardening shadows.
++Depth/slope and receiver bias reduce acne but require live tuning for detached contacts.
++
++Tests cover projection direction, texel stability, WGSL translation, real material
++composition, and an actual GPU caster→receiver check using an opaque/transparent
++texture. The GPU test explicitly reports a skip without an adapter; setting
++`AURORA_REQUIRE_GPU=1` makes that condition fail, as the Aurora preview launcher does.
++Final visual quality and performance must be checked in the running game.
+-- 
+2.50.1 (Apple Git-155)
+

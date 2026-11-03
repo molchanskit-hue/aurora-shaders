@@ -1,0 +1,213 @@
+From f174d633791d55dcce0e4cb9d581eb74582c1c28 Mon Sep 17 00:00:00 2001
+From: "Laze ." <laze.@MacBook-Pro-50.local>
+Date: Fri, 30 Oct 2026 01:01:01 -0400
+Subject: [PATCH] Expose semantic water faces to local Aurora material shaders
+
+Keep the packed terrain vertex at 24 bytes and preserve its HDR tier. Accept the explicit experimental API 0.1-aurora-water.1 alongside the original API.
+
+Co-Authored-By: Codex <noreply@openai.com>
+---
+ .../src/gfx/native_material.rs                |  9 +++++--
+ crates/horizon-client-render/src/mesher.rs    | 24 +++++++++++++++++--
+ .../horizon-client-render/src/mesher/fluid.rs |  5 ++++
+ crates/horizon-shader-api/src/inputs.rs       |  1 +
+ crates/horizon-shader-api/src/manifest.rs     |  6 +++--
+ crates/horizon-shader-api/src/stages.rs       |  4 +++-
+ crates/horizon-shader-api/tests/schema.rs     |  7 ++++++
+ docs/api/shaders-reference.md                 |  1 +
+ 8 files changed, 50 insertions(+), 7 deletions(-)
+
+diff --git a/crates/horizon-client-render/src/gfx/native_material.rs b/crates/horizon-client-render/src/gfx/native_material.rs
+index e7f8f7b..69d0b71 100644
+--- a/crates/horizon-client-render/src/gfx/native_material.rs
++++ b/crates/horizon-client-render/src/gfx/native_material.rs
+@@ -28,6 +28,7 @@ struct HorizonMaterialOut {
+     @location(5) position: vec3<f32>,
+     @location(6) spherical: f32,
+     @location(7) cylindrical: f32,
++    @location(8) @interpolate(flat) is_water: u32,
+ }
+ fn horizon_material_vertex(position: vec3<f32>, uv: vec2<f32>, layer: u32, color: vec4<f32>,
+     light: vec2<u32>, origin: vec3<f32>) -> HorizonMaterialOut {
+@@ -37,6 +38,8 @@ fn horizon_material_vertex(position: vec3<f32>, uv: vec2<f32>, layer: u32, color
+     out.uv = uv;
+     out.layer = layer;
+     out.tint = vec4(color.rgb, 1.0);
++    // mesher::NOT_WATER_BIT: clear only for semantic fluid water, not glass.
++    out.is_water = select(0u, 1u, (u32(round(color.a * 255.0)) & 128u) == 0u);
+     let block = max(f32(light.y), horizon_terrain_dynamic_block_light(pos));
+     let sky = f32(light.x);
+     // 16 per level, 15 levels.
+@@ -66,7 +69,7 @@ fn horizon_material_vertex(position: vec3<f32>, uv: vec2<f32>, layer: u32, color
+ fn horizon_material_color(in: HorizonMaterialOut, translucent: bool) -> vec4<f32> {
+     let albedo = horizon_terrain_sprite(in.uv, in.layer & 0x7fffu);
+     return material(MaterialInput(albedo, in.tint, in.light, in.lightmap, in.position, in.uv,
+-        translucent)).color;
++        translucent, translucent && in.is_water != 0u)).color;
+ }
+ @fragment fn horizon_material_fs_solid(in: HorizonMaterialOut) -> @location(0) vec4<f32> {
+     let color = horizon_material_color(in, false);
+@@ -297,7 +300,9 @@ mod tests {
+             fn apply_fog(c: vec4<f32>) -> vec4<f32> { return c * gain; }\n\
+             fn material(input: MaterialInput) -> Surface {\n    \
+                 let lit = input.albedo * input.tint * vec4(input.lightmap, 1.0);\n    \
+-                return Surface(apply_fog(sprite(lit)));\n}\n";
++                let normal = cross(dpdx(input.position), dpdy(input.position));\n    \
++                let water = select(0.0, abs(normal.y), input.is_water);\n    \
++                return Surface(apply_fog(sprite(lit)) + vec4(water * 0.01));\n}\n";
+         let stage = stage(own);
+         let module = module(&stage).unwrap();
+         let info = naga::valid::Validator::new(
+diff --git a/crates/horizon-client-render/src/mesher.rs b/crates/horizon-client-render/src/mesher.rs
+index 8328468..1abcd66 100644
+--- a/crates/horizon-client-render/src/mesher.rs
++++ b/crates/horizon-client-render/src/mesher.rs
+@@ -32,7 +32,7 @@ pub struct Vertex {
+     pub pos: [f32; 3],
+     pub uv: [f32; 2],
+     pub layer: u32,
+-    /// RGBA8: tint multiplied by directional shade and ambient occlusion.
++    /// RGB8 tint * shade * AO; alpha carries emission and `NOT_WATER_BIT`.
+     pub color: u32,
+     /// Smooth light, 16x fixed point: sky in bits 0..8, block in bits 8..16.
+     pub light: u32,
+@@ -131,6 +131,22 @@ mod vertex_tests {
+         );
+     }
+     #[test]
++    fn water_tag_preserves_rgb_hdr_and_vertex_layout() {
++        assert_eq!(std::mem::size_of::<TerrainVertex>(), 24);
++        let rgb = super::pack_rgb([0x12, 0x34, 0x56]);
++        for tier in 0..=super::VERY_BRIGHT {
++            let plain = super::emitting(rgb, tier);
++            let water = plain & !super::NOT_WATER_BIT;
++            assert_eq!(plain & 0x00FF_FFFF, water & 0x00FF_FFFF);
++            // terrain.wgsl decodes HDR from only the low alpha nibble.
++            assert_eq!(15 - ((water >> 24) & 15), u32::from(tier));
++            // Simulate the Unorm8 vertex fetch and native WGSL flag decode.
++            let alpha = ((water >> 24) as f32) / 255.0;
++            assert_eq!((alpha * 255.0).round() as u32 & 128, 0);
++            assert_ne!(plain & super::NOT_WATER_BIT, 0);
++        }
++    }
++    #[test]
+     fn light_sources_shine_by_kind_not_light_level() {
+         use super::{BRIGHT, INCANDESCENT, LOW, hdr_tier};
+         assert_eq!(hdr_tier("glowstone", 15), BRIGHT);
+@@ -675,8 +691,12 @@ impl Padded {
+ pub const OPAQUE_LAYER: u16 = 1 << 15;
+ /// The bits of `TerrainVertex::color`'s alpha byte that hold how brightly its face shines
+ /// in HDR output (`gfx/hdr.rs`): 15 minus the tier, so the usual 0xFF means none. The
+-/// byte's other four bits stay set.
++/// bit 7 marks non-water and the other three bits stay set.
+ pub const EMISSION_BITS: u32 = 0x0F00_0000;
++/// Cleared only on fluid water vertices. This unused alpha bit preserves the
++/// 24-byte vertex and the low-nibble HDR tier; shaders never use vertex alpha
++/// as opacity. Native material packs receive it as `MaterialInput.is_water`.
++pub const NOT_WATER_BIT: u32 = 0x8000_0000;
+ /// HDR tiers, by the kind of light rather than its level: a candle's flame is as bright as
+ /// a torch's, it only lights less around it. 0 stays as in SDR.
+ pub const LOW: u8 = 1;
+diff --git a/crates/horizon-client-render/src/mesher/fluid.rs b/crates/horizon-client-render/src/mesher/fluid.rs
+index 77fd93b..5a204cd 100644
+--- a/crates/horizon-client-render/src/mesher/fluid.rs
++++ b/crates/horizon-client-render/src/mesher/fluid.rs
+@@ -312,6 +312,11 @@ pub(super) fn tesselate(
+     };
+     let mut quad =
+         |v: [([f32; 3], [f32; 2]); 4], layer: u16, color: u32, light: u16, back: bool| {
++            let color = if water {
++                color & !super::NOT_WATER_BIT
++            } else {
++                color
++            };
+             let vertex = |(pos, uv)| TerrainVertex::new(pos, uv, layer, color, light);
+             target.extend(v.map(vertex));
+             if back {
+diff --git a/crates/horizon-shader-api/src/inputs.rs b/crates/horizon-shader-api/src/inputs.rs
+index f25fe28..a70c74e 100644
+--- a/crates/horizon-shader-api/src/inputs.rs
++++ b/crates/horizon-shader-api/src/inputs.rs
+@@ -176,6 +176,7 @@ pub const MATERIAL_INPUT: Struct = Struct {
+         position: "vec3<f32>" = "The point, camera-relative, in blocks.",
+         uv: "vec2<f32>" = "The texture coordinate inside the block atlas.",
+         translucent: "bool" = "Drawn in the translucent pass (water, stained glass, ice).",
++        is_water: "bool" = "Aurora local extension (API 0.1-aurora-water.1): a fluid water face, including flowing/waterlogged water. False for glass, ice and lava; modelled cauldron water is not tagged.",
+     },
+ };
+ 
+diff --git a/crates/horizon-shader-api/src/manifest.rs b/crates/horizon-shader-api/src/manifest.rs
+index d03a4f2..711c76f 100644
+--- a/crates/horizon-shader-api/src/manifest.rs
++++ b/crates/horizon-shader-api/src/manifest.rs
+@@ -8,6 +8,8 @@ pub const SCHEMA: u32 = 1;
+ /// The shader API line this build serves: the stages, their signatures and
+ /// the inputs a pack's WGSL may read.
+ pub const API: &str = "0.1";
++/// Experimental local Aurora extension, deliberately rejected by stock Horizon.
++pub const AURORA_WATER_API: &str = "0.1-aurora-water.1";
+ /// Full-screen passes a pack may chain.
+ pub const MAX_POST_PASSES: usize = 8;
+ /// Options a pack may declare.
+@@ -139,9 +141,9 @@ impl Manifest {
+                 raw.schema
+             )));
+         }
+-        if raw.api != API {
++        if raw.api != API && raw.api != AURORA_WATER_API {
+             return Err(err(format!(
+-                "written for shader API {}; this Horizon serves {API}",
++                "written for shader API {}; this Horizon serves {API} and {AURORA_WATER_API}",
+                 raw.api
+             )));
+         }
+diff --git a/crates/horizon-shader-api/src/stages.rs b/crates/horizon-shader-api/src/stages.rs
+index 12bd3e0..1df33b2 100644
+--- a/crates/horizon-shader-api/src/stages.rs
++++ b/crates/horizon-shader-api/src/stages.rs
+@@ -116,9 +116,11 @@ struct HorizonMaterialIn {
+     @location(4) world: vec3<f32>,
+     @location(5) uv: vec2<f32>,
+     @location(6) @interpolate(flat) translucent: u32,
++    @location(7) @interpolate(flat) is_water: u32,
+ }
+ @fragment fn horizon_fs_material(in: HorizonMaterialIn) -> @location(0) vec4<f32> {
+-    let input = MaterialInput(in.albedo, in.tint, in.light, in.lightmap, in.world, in.uv, in.translucent != 0u);
++    let input = MaterialInput(in.albedo, in.tint, in.light, in.lightmap, in.world, in.uv,
++        in.translucent != 0u, in.is_water != 0u);
+     return material(input).color;
+ }
+ ";
+diff --git a/crates/horizon-shader-api/tests/schema.rs b/crates/horizon-shader-api/tests/schema.rs
+index 2176805..0d83639 100644
+--- a/crates/horizon-shader-api/tests/schema.rs
++++ b/crates/horizon-shader-api/tests/schema.rs
+@@ -13,6 +13,13 @@ fn sample_text() -> String {
+     std::fs::read_to_string(sample_dir().join(MANIFEST)).unwrap()
+ }
+ 
++#[test]
++fn local_water_api_is_explicit_and_unknown_extensions_are_rejected() {
++    let local = sample_text().replace("api = \"0.1\"", "api = \"0.1-aurora-water.1\"");
++    assert_eq!(Manifest::parse(&local).unwrap().api, "0.1-aurora-water.1");
++    assert!(Manifest::parse(&local.replace("water.1", "water.2")).is_err());
++}
++
+ fn refused(text: &str) -> String {
+     Manifest::parse(text).expect_err("should be refused")
+ }
+diff --git a/docs/api/shaders-reference.md b/docs/api/shaders-reference.md
+index 400d502..86f3b46 100644
+--- a/docs/api/shaders-reference.md
++++ b/docs/api/shaders-reference.md
+@@ -51,6 +51,7 @@ One point of a block's surface, for `fn material(input: MaterialInput) -> Surfac
+ | `position` | `vec3<f32>` | The point, camera-relative, in blocks. |
+ | `uv` | `vec2<f32>` | The texture coordinate inside the block atlas. |
+ | `translucent` | `bool` | Drawn in the translucent pass (water, stained glass, ice). |
++| `is_water` | `bool` | Aurora local extension (API 0.1-aurora-water.1): a fluid water face, including flowing/waterlogged water. False for glass, ice and lava; modelled cauldron water is not tagged. |
+ 
+ ### `Surface`
+ 
+-- 
+2.50.1 (Apple Git-155)
+

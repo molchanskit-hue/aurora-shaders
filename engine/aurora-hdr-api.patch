@@ -1,0 +1,2028 @@
+diff --git a/crates/horizon-client-render/Cargo.toml b/crates/horizon-client-render/Cargo.toml
+index 75cf5ee..d421233 100644
+--- a/crates/horizon-client-render/Cargo.toml
++++ b/crates/horizon-client-render/Cargo.toml
+@@ -31,7 +31,7 @@ flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs",
+ glam = "0.30"
+ log = "0.4"
+ miniz_oxide = "0.8"
+-naga = { version = "30.0.1", features = ["wgsl-in", "hlsl-out"] }
++naga = { version = "30.0.1", features = ["wgsl-in", "wgsl-out", "hlsl-out"] }
+ png = "0.18"
+ pollster = "0.4"
+ serde = { version = "1", features = ["derive"] }
+@@ -64,4 +64,4 @@ workspace = true
+ 
+ [dev-dependencies]
+ horizon-items = { path = "../horizon-items", features = ["test-support"] }
+-naga = { version = "30.0.1", features = ["wgsl-in", "hlsl-out", "msl-out", "spv-out"] }
++naga = { version = "30.0.1", features = ["wgsl-in", "wgsl-out", "hlsl-out", "msl-out", "spv-out"] }
+diff --git a/crates/horizon-client-render/src/gfx.rs b/crates/horizon-client-render/src/gfx.rs
+index 5d24dd7..1963d79 100644
+--- a/crates/horizon-client-render/src/gfx.rs
++++ b/crates/horizon-client-render/src/gfx.rs
+@@ -79,6 +79,7 @@ pub mod lightning;
+ mod lod;
+ mod native_contact;
+ mod native_entity;
++mod native_hdr;
+ mod native_material;
+ mod native_pack;
+ mod native_post;
+@@ -574,6 +575,7 @@ pub struct Renderer {
+     pack_post: Option<(i32, Option<pack_post::PackPost>)>,
+     /// The post passes of one of Horizon's own shader packs; never beside `pack_post`'s.
+     native: Option<native_pack::NativePack>,
++    hdr_pipelines: native_hdr::Pipelines,
+     /// Time the shader pack's passes on the GPU (F3, or `HORIZON_SHADER_PACK_TIMING`).
+     pass_timing: bool,
+     /// The entity vertices Horizon draws itself while a shader pack draws the others.
+@@ -1222,6 +1224,11 @@ impl Renderer {
+         if previous.is_none() {
+             startup_step(format_args!("creating the pipelines"));
+         }
++        let hdr_builder =
++            native_hdr::Builder::new(std::env::var("AURORA_HDR_PIPELINES").as_deref() == Ok("1"));
++        let hdr_terrain = hdr_builder.module(&device, include_str!("terrain.wgsl"));
++        let hdr_entity = hdr_builder.module(&device, &entity_shader());
++        let hdr_border = hdr_builder.module(&device, include_str!("border.wgsl"));
+         let gpu_timer = timing::GpuTimer::new(&device, &queue);
+         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+             label: Some("Horizon terrain"),
+@@ -1332,48 +1339,52 @@ impl Renderer {
+                            depth_write: bool,
+                            depth_test: bool,
+                            blend: Option<wgpu::BlendState>| {
+-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+-                label: Some(label),
+-                layout: Some(layout),
+-                vertex: wgpu::VertexState {
+-                    module: &shader,
+-                    entry_point: Some(vertex),
+-                    compilation_options: Default::default(),
+-                    buffers,
+-                },
+-                primitive: wgpu::PrimitiveState {
+-                    topology,
+-                    cull_mode: cull,
+-                    ..Default::default()
+-                },
+-                depth_stencil: Some(wgpu::DepthStencilState {
+-                    format: wgpu::TextureFormat::Depth32Float,
+-                    depth_write_enabled: Some(depth_write),
+-                    depth_compare: Some(if depth_test {
+-                        wgpu::CompareFunction::GreaterEqual
+-                    } else {
+-                        wgpu::CompareFunction::Always
+-                    }),
+-                    stencil: Default::default(),
+-                    bias: Default::default(),
+-                }),
+-                multisample: Default::default(),
+-                fragment: Some(wgpu::FragmentState {
+-                    module: &shader,
+-                    entry_point: Some(fragment),
+-                    compilation_options: wgpu::PipelineCompilationOptions {
+-                        constants: &sprite_constants,
++            hdr_builder.create(
++                &device,
++                &wgpu::RenderPipelineDescriptor {
++                    label: Some(label),
++                    layout: Some(layout),
++                    vertex: wgpu::VertexState {
++                        module: &shader,
++                        entry_point: Some(vertex),
++                        compilation_options: Default::default(),
++                        buffers,
++                    },
++                    primitive: wgpu::PrimitiveState {
++                        topology,
++                        cull_mode: cull,
+                         ..Default::default()
+                     },
+-                    targets: &[Some(wgpu::ColorTargetState {
+-                        format: config.format.remove_srgb_suffix(),
+-                        blend,
+-                        write_mask: wgpu::ColorWrites::ALL,
+-                    })],
+-                }),
+-                multiview_mask: None,
+-                cache: None,
+-            })
++                    depth_stencil: Some(wgpu::DepthStencilState {
++                        format: wgpu::TextureFormat::Depth32Float,
++                        depth_write_enabled: Some(depth_write),
++                        depth_compare: Some(if depth_test {
++                            wgpu::CompareFunction::GreaterEqual
++                        } else {
++                            wgpu::CompareFunction::Always
++                        }),
++                        stencil: Default::default(),
++                        bias: Default::default(),
++                    }),
++                    multisample: Default::default(),
++                    fragment: Some(wgpu::FragmentState {
++                        module: &shader,
++                        entry_point: Some(fragment),
++                        compilation_options: wgpu::PipelineCompilationOptions {
++                            constants: &sprite_constants,
++                            ..Default::default()
++                        },
++                        targets: &[Some(wgpu::ColorTargetState {
++                            format: config.format.remove_srgb_suffix(),
++                            blend,
++                            write_mask: wgpu::ColorWrites::ALL,
++                        })],
++                    }),
++                    multiview_mask: None,
++                    cache: None,
++                },
++                hdr_terrain.as_ref(),
++            )
+         };
+         let pipeline = |label: &str,
+                         vertex: &str,
+@@ -1747,11 +1758,12 @@ impl Renderer {
+             source: wgpu::ShaderSource::Wgsl(entity_shader().into()),
+         });
+         let entity_bindings = native_entity::bindings(&device);
+-        let weather = weather::Weather::new(
++        let weather = weather::Weather::new_with_hdr(
+             &device,
+             config.format.remove_srgb_suffix(),
+             &entity_bindings,
+             &entity_shader,
++            Some(&hdr_builder),
+         );
+         let atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+             label: Some("Atlas"),
+@@ -1891,44 +1903,48 @@ impl Renderer {
+                                     clouds,
+                                     fragment: &str,
+                                     write_mask| {
+-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+-                label: Some(label),
+-                layout: Some(if clouds {
+-                    &cloud_layout
+-                } else {
+-                    &entity_layout
+-                }),
+-                vertex: wgpu::VertexState {
+-                    module: &entity_shader,
+-                    entry_point: Some(if clouds { "vs_cloud" } else { "vs_entity" }),
+-                    compilation_options: Default::default(),
+-                    buffers: &entity_vertex,
+-                },
+-                primitive: wgpu::PrimitiveState {
+-                    cull_mode,
+-                    ..Default::default()
++            hdr_builder.create(
++                &device,
++                &wgpu::RenderPipelineDescriptor {
++                    label: Some(label),
++                    layout: Some(if clouds {
++                        &cloud_layout
++                    } else {
++                        &entity_layout
++                    }),
++                    vertex: wgpu::VertexState {
++                        module: &entity_shader,
++                        entry_point: Some(if clouds { "vs_cloud" } else { "vs_entity" }),
++                        compilation_options: Default::default(),
++                        buffers: &entity_vertex,
++                    },
++                    primitive: wgpu::PrimitiveState {
++                        cull_mode,
++                        ..Default::default()
++                    },
++                    depth_stencil: Some(wgpu::DepthStencilState {
++                        format: wgpu::TextureFormat::Depth32Float,
++                        depth_write_enabled: Some(depth_write),
++                        depth_compare: Some(compare),
++                        stencil: Default::default(),
++                        bias,
++                    }),
++                    multisample: Default::default(),
++                    fragment: Some(wgpu::FragmentState {
++                        module: &entity_shader,
++                        entry_point: Some(fragment),
++                        compilation_options: Default::default(),
++                        targets: &[Some(wgpu::ColorTargetState {
++                            format: config.format.remove_srgb_suffix(),
++                            blend: Some(blend),
++                            write_mask,
++                        })],
++                    }),
++                    multiview_mask: None,
++                    cache: None,
+                 },
+-                depth_stencil: Some(wgpu::DepthStencilState {
+-                    format: wgpu::TextureFormat::Depth32Float,
+-                    depth_write_enabled: Some(depth_write),
+-                    depth_compare: Some(compare),
+-                    stencil: Default::default(),
+-                    bias,
+-                }),
+-                multisample: Default::default(),
+-                fragment: Some(wgpu::FragmentState {
+-                    module: &entity_shader,
+-                    entry_point: Some(fragment),
+-                    compilation_options: Default::default(),
+-                    targets: &[Some(wgpu::ColorTargetState {
+-                        format: config.format.remove_srgb_suffix(),
+-                        blend: Some(blend),
+-                        write_mask,
+-                    })],
+-                }),
+-                multiview_mask: None,
+-                cache: None,
+-            })
++                hdr_entity.as_ref(),
++            )
+         };
+         let entity_pipeline = |label, cull_mode, depth_write, compare, bias, blend, clouds| {
+             entity_pipeline_with(
+@@ -2137,65 +2153,74 @@ impl Renderer {
+             multiview_mask: None,
+             cache: None,
+         };
+-        let additive_pipeline = device.create_render_pipeline(&additive_descriptor);
+-        let lightning_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+-            label: Some("Lightning"),
+-            vertex: wgpu::VertexState {
+-                entry_point: Some("vs_lightning"),
+-                buffers: &lightning_vertex,
+-                ..additive_descriptor.vertex.clone()
+-            },
+-            ..additive_descriptor
+-        });
+-        let celestial_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+-            label: Some("Celestial bodies"),
+-            layout: Some(&entity_layout),
+-            vertex: wgpu::VertexState {
+-                module: &entity_shader,
+-                entry_point: Some("vs_entity"),
+-                compilation_options: Default::default(),
+-                buffers: &entity_vertex,
++        let additive_pipeline =
++            hdr_builder.create(&device, &additive_descriptor, hdr_entity.as_ref());
++        let lightning_pipeline = hdr_builder.create(
++            &device,
++            &wgpu::RenderPipelineDescriptor {
++                label: Some("Lightning"),
++                vertex: wgpu::VertexState {
++                    entry_point: Some("vs_lightning"),
++                    buffers: &lightning_vertex,
++                    ..additive_descriptor.vertex.clone()
++                },
++                ..additive_descriptor
+             },
+-            primitive: wgpu::PrimitiveState {
+-                cull_mode: None,
+-                ..Default::default()
++            hdr_entity.as_ref(),
++        );
++        let celestial_pipeline = hdr_builder.create(
++            &device,
++            &wgpu::RenderPipelineDescriptor {
++                label: Some("Celestial bodies"),
++                layout: Some(&entity_layout),
++                vertex: wgpu::VertexState {
++                    module: &entity_shader,
++                    entry_point: Some("vs_entity"),
++                    compilation_options: Default::default(),
++                    buffers: &entity_vertex,
++                },
++                primitive: wgpu::PrimitiveState {
++                    cull_mode: None,
++                    ..Default::default()
++                },
++                depth_stencil: Some(wgpu::DepthStencilState {
++                    format: wgpu::TextureFormat::Depth32Float,
++                    depth_write_enabled: Some(false),
++                    depth_compare: Some(wgpu::CompareFunction::Always),
++                    stencil: Default::default(),
++                    bias: Default::default(),
++                }),
++                multisample: Default::default(),
++                fragment: Some(wgpu::FragmentState {
++                    module: &entity_shader,
++                    entry_point: Some("fs_sky_celestial"),
++                    compilation_options: Default::default(),
++                    targets: &[Some(wgpu::ColorTargetState {
++                        format: config.format.remove_srgb_suffix(),
++                        // RenderPipelines.CELESTIAL: additive (src alpha, one), with
++                        // the colour premultiplied in fs_sky_celestial. Its alpha is
++                        // how much a texel adds: HDR output (hdr.wgsl) lets the sun's
++                        // and moon's discs shine; nothing else reads the frame's alpha.
++                        blend: Some(wgpu::BlendState {
++                            color: wgpu::BlendComponent {
++                                src_factor: wgpu::BlendFactor::One,
++                                dst_factor: wgpu::BlendFactor::One,
++                                operation: wgpu::BlendOperation::Add,
++                            },
++                            alpha: wgpu::BlendComponent {
++                                src_factor: wgpu::BlendFactor::Zero,
++                                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
++                                operation: wgpu::BlendOperation::Add,
++                            },
++                        }),
++                        write_mask: wgpu::ColorWrites::ALL,
++                    })],
++                }),
++                multiview_mask: None,
++                cache: None,
+             },
+-            depth_stencil: Some(wgpu::DepthStencilState {
+-                format: wgpu::TextureFormat::Depth32Float,
+-                depth_write_enabled: Some(false),
+-                depth_compare: Some(wgpu::CompareFunction::Always),
+-                stencil: Default::default(),
+-                bias: Default::default(),
+-            }),
+-            multisample: Default::default(),
+-            fragment: Some(wgpu::FragmentState {
+-                module: &entity_shader,
+-                entry_point: Some("fs_sky_celestial"),
+-                compilation_options: Default::default(),
+-                targets: &[Some(wgpu::ColorTargetState {
+-                    format: config.format.remove_srgb_suffix(),
+-                    // RenderPipelines.CELESTIAL: additive (src alpha, one), with
+-                    // the colour premultiplied in fs_sky_celestial. Its alpha is
+-                    // how much a texel adds: HDR output (hdr.wgsl) lets the sun's
+-                    // and moon's discs shine; nothing else reads the frame's alpha.
+-                    blend: Some(wgpu::BlendState {
+-                        color: wgpu::BlendComponent {
+-                            src_factor: wgpu::BlendFactor::One,
+-                            dst_factor: wgpu::BlendFactor::One,
+-                            operation: wgpu::BlendOperation::Add,
+-                        },
+-                        alpha: wgpu::BlendComponent {
+-                            src_factor: wgpu::BlendFactor::Zero,
+-                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+-                            operation: wgpu::BlendOperation::Add,
+-                        },
+-                    }),
+-                    write_mask: wgpu::ColorWrites::ALL,
+-                })],
+-            }),
+-            multiview_mask: None,
+-            cache: None,
+-        });
++            hdr_entity.as_ref(),
++        );
+         // WorldBorderRenderer: misc/forcefield.png as a MipmappedTexture
+         // (repeat, linear minification with mipmaps, nearest magnification).
+         let forcefield_size = forcefield.1;
+@@ -2312,59 +2337,64 @@ impl Renderer {
+         let border_attributes = wgpu::vertex_attr_array![0=>Float32x3,1=>Float32x2];
+         // RenderPipelines.WORLD_BORDER: BlendFunction.OVERLAY, no culling,
+         // depth writes with a polygon offset of 3 towards the camera.
+-        let border_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+-            label: Some("World border"),
+-            layout: Some(&border_layout),
+-            vertex: wgpu::VertexState {
+-                module: &border_shader,
+-                entry_point: Some("vs_border"),
+-                compilation_options: Default::default(),
+-                buffers: &[Some(wgpu::VertexBufferLayout {
+-                    array_stride: std::mem::size_of::<crate::border_render::BorderVertex>() as u64,
+-                    step_mode: wgpu::VertexStepMode::Vertex,
+-                    attributes: &border_attributes,
+-                })],
+-            },
+-            primitive: wgpu::PrimitiveState {
+-                cull_mode: None,
+-                ..Default::default()
+-            },
+-            depth_stencil: Some(wgpu::DepthStencilState {
+-                format: wgpu::TextureFormat::Depth32Float,
+-                depth_write_enabled: Some(true),
+-                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+-                stencil: Default::default(),
+-                bias: wgpu::DepthBiasState {
+-                    constant: 3,
+-                    slope_scale: 3.0,
+-                    clamp: 0.0,
++        let border_pipeline = hdr_builder.create(
++            &device,
++            &wgpu::RenderPipelineDescriptor {
++                label: Some("World border"),
++                layout: Some(&border_layout),
++                vertex: wgpu::VertexState {
++                    module: &border_shader,
++                    entry_point: Some("vs_border"),
++                    compilation_options: Default::default(),
++                    buffers: &[Some(wgpu::VertexBufferLayout {
++                        array_stride: std::mem::size_of::<crate::border_render::BorderVertex>()
++                            as u64,
++                        step_mode: wgpu::VertexStepMode::Vertex,
++                        attributes: &border_attributes,
++                    })],
+                 },
+-            }),
+-            multisample: Default::default(),
+-            fragment: Some(wgpu::FragmentState {
+-                module: &border_shader,
+-                entry_point: Some("fs_border"),
+-                compilation_options: Default::default(),
+-                targets: &[Some(wgpu::ColorTargetState {
+-                    format: config.format.remove_srgb_suffix(),
+-                    blend: Some(wgpu::BlendState {
+-                        color: wgpu::BlendComponent {
+-                            src_factor: wgpu::BlendFactor::SrcAlpha,
+-                            dst_factor: wgpu::BlendFactor::One,
+-                            operation: wgpu::BlendOperation::Add,
+-                        },
+-                        alpha: wgpu::BlendComponent {
+-                            src_factor: wgpu::BlendFactor::One,
+-                            dst_factor: wgpu::BlendFactor::Zero,
+-                            operation: wgpu::BlendOperation::Add,
+-                        },
+-                    }),
+-                    write_mask: wgpu::ColorWrites::ALL,
+-                })],
+-            }),
+-            multiview_mask: None,
+-            cache: None,
+-        });
++                primitive: wgpu::PrimitiveState {
++                    cull_mode: None,
++                    ..Default::default()
++                },
++                depth_stencil: Some(wgpu::DepthStencilState {
++                    format: wgpu::TextureFormat::Depth32Float,
++                    depth_write_enabled: Some(true),
++                    depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
++                    stencil: Default::default(),
++                    bias: wgpu::DepthBiasState {
++                        constant: 3,
++                        slope_scale: 3.0,
++                        clamp: 0.0,
++                    },
++                }),
++                multisample: Default::default(),
++                fragment: Some(wgpu::FragmentState {
++                    module: &border_shader,
++                    entry_point: Some("fs_border"),
++                    compilation_options: Default::default(),
++                    targets: &[Some(wgpu::ColorTargetState {
++                        format: config.format.remove_srgb_suffix(),
++                        blend: Some(wgpu::BlendState {
++                            color: wgpu::BlendComponent {
++                                src_factor: wgpu::BlendFactor::SrcAlpha,
++                                dst_factor: wgpu::BlendFactor::One,
++                                operation: wgpu::BlendOperation::Add,
++                            },
++                            alpha: wgpu::BlendComponent {
++                                src_factor: wgpu::BlendFactor::One,
++                                dst_factor: wgpu::BlendFactor::Zero,
++                                operation: wgpu::BlendOperation::Add,
++                            },
++                        }),
++                        write_mask: wgpu::ColorWrites::ALL,
++                    })],
++                }),
++                multiview_mask: None,
++                cache: None,
++            },
++            hdr_border.as_ref(),
++        );
+         let screen_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+             label: Some("Horizon screen effects"),
+             source: wgpu::ShaderSource::Wgsl(include_str!("screen.wgsl").into()),
+@@ -2533,7 +2563,11 @@ impl Renderer {
+         let world_post = world_post::Post::new(&device, config.format.remove_srgb_suffix());
+         let uploads = upload::Uploads::new(&device);
+         let section_uploads = upload::Uploads::with_chunk(&device, SECTION_UPLOAD_CHUNK);
+-        let stars = stars::Stars::new(&device, config.format.remove_srgb_suffix());
++        let stars = stars::Stars::new_with_hdr(
++            &device,
++            config.format.remove_srgb_suffix(),
++            Some(&hdr_builder),
++        );
+         let entity_outline = entity_outline::EntityOutline::new(
+             &device,
+             (&entity_shader, &entity_layout, &entity_vertex),
+@@ -2692,6 +2726,7 @@ impl Renderer {
+             hdr_marker: None,
+             pack_post: None,
+             native: None,
++            hdr_pipelines: hdr_builder.finish(),
+             pass_timing: pack_timing::PassTiming::logging(),
+             pack_entity_rest: Vec::new(),
+             cloud_bindings,
+@@ -2718,13 +2753,19 @@ impl Renderer {
+     }
+     /// LevelRenderer.submitBlockOutline: the buffer holds `edges` per stroke, the black
+     /// secondary stroke first when high contrast is on.
+-    fn draw_outline(&self, pass: &mut wgpu::RenderPass<'_>, edges: u32, high_contrast: bool) {
++    fn draw_outline(
++        &self,
++        pass: &mut wgpu::RenderPass<'_>,
++        edges: u32,
++        high_contrast: bool,
++        scene_hdr: bool,
++    ) {
+         pass.set_vertex_buffer(0, self.outline.slice(..));
+         if high_contrast {
+-            pass.set_pipeline(&self.lines_secondary);
++            pass.set_pipeline(self.scene_pipeline(&self.lines_secondary, scene_hdr));
+             pass.draw(0..4, 0..edges);
+         }
+-        pass.set_pipeline(&self.lines);
++        pass.set_pipeline(self.scene_pipeline(&self.lines, scene_hdr));
+         let first = if high_contrast { edges } else { 0 };
+         pass.draw(0..4, first..first + edges);
+     }
+@@ -3411,8 +3452,24 @@ impl Renderer {
+             .as_ref()
+             .is_some_and(|n| n.water_environment && n.post.is_some())
+     }
+-    fn native_entity_pipeline<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, hand: bool) {
+-        if let Some(native) = &self.native
++    fn scene_pipeline<'a>(
++        &'a self,
++        pipeline: &'a wgpu::RenderPipeline,
++        hdr: bool,
++    ) -> &'a wgpu::RenderPipeline {
++        if hdr {
++            self.hdr_pipelines.get(pipeline)
++        } else {
++            pipeline
++        }
++    }
++    fn native_entity_pipeline<'a>(
++        &'a self,
++        pass: &mut wgpu::RenderPass<'a>,
++        hand: bool,
++        title: bool,
++    ) {
++        if let Some(native) = self.native.as_ref().filter(|_| !title)
+             && let Some(entity) = &native.entity
+         {
+             pass.set_pipeline(if hand { &entity.hand } else { &entity.world });
+@@ -3441,6 +3498,9 @@ impl Renderer {
+             self.native = None;
+             return Ok(Vec::new());
+         };
++        if report.scene_hdr && !self.hdr_pipelines.enabled() {
++            return Err("hdr.1 needs a renderer started with AURORA_HDR_PIPELINES=1".into());
++        }
+         let terrain = native_material::TerrainShape {
+             globals: &self.terrain_layout,
+             flat: self.flat.as_ref().map(|f| &f.draw_layout),
+@@ -3897,6 +3957,7 @@ impl Renderer {
+         // Solid quads facing away from the eye are left out: the bob moves
+         // the eye off `camera`, so it is found from the projection.
+         let eye = projection_center(cull_proj).filter(|_| self.sides_on);
++        let scene_hdr = !frame.title && self.native.as_ref().is_some_and(|n| n.scene_hdr);
+         let culling = !frame.title && frame.cave_culling;
+         if culling {
+             crate::spans::time("occlusion", || {
+@@ -4022,6 +4083,9 @@ impl Renderer {
+                 self.cull_on
+                     && !frame.title
+                     && !pack_terrain
++                    // The GPU box-test pipeline has an SDR colour attachment.
++                    // CPU cave reachability and frustum culling remain active.
++                    && !scene_hdr
+                     && self.multi_draw
+                     && visible.len() >= c.min_sections
+             })
+@@ -4680,6 +4744,7 @@ impl Renderer {
+             &self.device,
+             [self.config.width, self.config.height],
+             pack_reads_world,
++            scene_hdr,
+         );
+         let (world_view, world_depth) = match &scaled {
+             Some((color, depth)) => (color, depth),
+@@ -4689,7 +4754,7 @@ impl Renderer {
+             cull.bind_depth(&self.device, world_depth);
+         }
+         let cull = self.cull.as_ref().filter(|_| culling && solid_draws > 0);
+-        let clear = if frame.title || (frame.end_sky && !frame.underwater && sky_open(frame)) {
++        let mut clear = if frame.title || (frame.end_sky && !frame.underwater && sky_open(frame)) {
+             wgpu::Color::BLACK
+         } else {
+             wgpu::Color {
+@@ -4699,6 +4764,18 @@ impl Renderer {
+                 a: 1.0,
+             }
+         };
++        if scene_hdr {
++            let decode = |c: f64| {
++                if c <= 0.04045 {
++                    c / 12.92
++                } else {
++                    ((c + 0.055) / 1.055).powf(2.4)
++                }
++            };
++            clear.r = decode(clear.r);
++            clear.g = decode(clear.g);
++            clear.b = decode(clear.b);
++        }
+         let sky_visible = sky_open(frame);
+         // One of Horizon's own packs: this frame's inputs; in a timed frame its sky draws in a
+         // pass of its own, so that it has a time of its own.
+@@ -4807,7 +4884,11 @@ impl Renderer {
+             && let Some(sky) = &native.sky
+         {
+             if let Some(t) = &mut native.timing {
+-                let format = self.config.format.remove_srgb_suffix();
++                let format = if scene_hdr {
++                    native_hdr::FORMAT
++                } else {
++                    self.config.format.remove_srgb_suffix()
++                };
+                 t.mark(&self.device, &mut encoder, (world_view, format));
+             }
+             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+@@ -4894,7 +4975,7 @@ impl Renderer {
+                     {
+                         Some((sky, native)) => sky.draw(&mut pass, native),
+                         None => {
+-                            pass.set_pipeline(&self.sky);
++                            pass.set_pipeline(self.scene_pipeline(&self.sky, scene_hdr));
+                             pass.draw(0..3, 0..1);
+                         }
+                     }
+@@ -4903,7 +4984,7 @@ impl Renderer {
+                     self.panorama.draw(&mut pass);
+                     pass.set_bind_group(0, &self.group, &[]);
+                 } else if celestial_vertices > 0 || frame.end_sky {
+-                    pass.set_pipeline(&self.celestial_pipeline);
++                    pass.set_pipeline(self.scene_pipeline(&self.celestial_pipeline, scene_hdr));
+                     pass.set_bind_group(0, &self.entity_group, &[]);
+                     pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
+                     if frame.end_sky {
+@@ -4924,11 +5005,12 @@ impl Renderer {
+                     pass.set_bind_group(0, &self.group, &[]);
+                 }
+                 if !frame.title && frame.stars.is_some() && !pack_draws_sky {
+-                    self.stars.draw(&mut pass);
++                    self.stars
++                        .draw_with_hdr(&mut pass, scene_hdr.then_some(&self.hdr_pipelines));
+                     pass.set_bind_group(0, &self.group, &[]);
+                 }
+                 if !frame.title && frame.dark_disc && !pack_draws_sky {
+-                    pass.set_pipeline(&self.dark_disc);
++                    pass.set_pipeline(self.scene_pipeline(&self.dark_disc, scene_hdr));
+                     pass.draw(0..3, 0..1);
+                 }
+             }
+@@ -5011,25 +5093,27 @@ impl Renderer {
+                 }
+             }
+             if entity_quads > 0 {
+-                self.native_entity_pipeline(&mut pass, false);
++                self.native_entity_pipeline(&mut pass, false, frame.title);
+                 pass.set_bind_group(0, &self.entity_group, &[]);
+                 pass.set_vertex_buffer(0, self.entity_buffer.slice(..));
+                 pass.draw_indexed(0..entity_quads * 6, 0, 0..1);
+                 if self.hdr.is_some() {
+-                    pass.set_pipeline(&self.hdr_mark_pipeline);
++                    pass.set_pipeline(self.scene_pipeline(&self.hdr_mark_pipeline, scene_hdr));
+                     pass.draw_indexed(0..entity_quads * 6, 0, 0..1);
+                 }
+                 pass.set_bind_group(0, &self.group, &[]);
+             }
+             if text_quads > 0 {
+-                pass.set_pipeline(&self.text_polygon_offset_pipeline);
++                pass.set_pipeline(
++                    self.scene_pipeline(&self.text_polygon_offset_pipeline, scene_hdr),
++                );
+                 pass.set_bind_group(0, &self.entity_group, &[]);
+                 pass.set_vertex_buffer(0, self.entity_buffer.slice(..));
+                 pass.draw_indexed(0..text_quads * 6, (entity_quads * 4) as i32, 0..1);
+                 pass.set_bind_group(0, &self.group, &[]);
+             }
+             if translucent_item_quads > 0 {
+-                pass.set_pipeline(&self.translucent_item_pipeline);
++                pass.set_pipeline(self.scene_pipeline(&self.translucent_item_pipeline, scene_hdr));
+                 pass.set_bind_group(0, &self.entity_group, &[]);
+                 pass.set_vertex_buffer(0, self.entity_buffer.slice(..));
+                 pass.draw_indexed(
+@@ -5040,11 +5124,15 @@ impl Renderer {
+                 pass.set_bind_group(0, &self.group, &[]);
+             }
+             if !pack_draws_weather {
+-                self.weather.draw(&mut pass, &self.entity_group);
++                self.weather.draw_with_hdr(
++                    &mut pass,
++                    &self.entity_group,
++                    scene_hdr.then_some(&self.hdr_pipelines),
++                );
+             }
+             pass.set_bind_group(0, &self.group, &[]);
+             if crumbling_quads > 0 {
+-                pass.set_pipeline(&self.crumbling_pipeline);
++                pass.set_pipeline(self.scene_pipeline(&self.crumbling_pipeline, scene_hdr));
+                 pass.set_bind_group(0, &self.entity_group, &[]);
+                 pass.set_vertex_buffer(0, self.entity_buffer.slice(..));
+                 pass.draw_indexed(
+@@ -5055,7 +5143,7 @@ impl Renderer {
+                 pass.set_bind_group(0, &self.group, &[]);
+             }
+             if shadow_quads > 0 {
+-                pass.set_pipeline(&self.shadow_blob_pipeline);
++                pass.set_pipeline(self.scene_pipeline(&self.shadow_blob_pipeline, scene_hdr));
+                 pass.set_bind_group(0, &self.entity_group, &[]);
+                 pass.set_vertex_buffer(0, self.entity_buffer.slice(..));
+                 pass.draw_indexed(
+@@ -5072,7 +5160,7 @@ impl Renderer {
+             // BoatRenderer's water patch (RenderTypes.waterMask): depth only,
+             // before translucent terrain, so no water shows inside the boat.
+             if water_mask_quads > 0 {
+-                pass.set_pipeline(&self.water_mask_pipeline);
++                pass.set_pipeline(self.scene_pipeline(&self.water_mask_pipeline, scene_hdr));
+                 pass.set_bind_group(0, &self.entity_group, &[]);
+                 pass.set_vertex_buffer(0, self.entity_buffer.slice(..));
+                 pass.draw_indexed(
+@@ -5084,13 +5172,13 @@ impl Renderer {
+                 pass.set_bind_group(0, &self.group, &[]);
+             }
+             if !frame.lightning.bolts.is_empty() {
+-                pass.set_pipeline(&self.lightning_pipeline);
++                pass.set_pipeline(self.scene_pipeline(&self.lightning_pipeline, scene_hdr));
+                 pass.set_bind_group(0, &self.entity_group, &[]);
+                 self.lightning.draw(&mut pass, &frame.lightning);
+                 pass.set_bind_group(0, &self.group, &[]);
+             }
+             if swirl_quads > 0 {
+-                pass.set_pipeline(&self.energy_swirl_pipeline);
++                pass.set_pipeline(self.scene_pipeline(&self.energy_swirl_pipeline, scene_hdr));
+                 pass.set_bind_group(0, &self.entity_group, &[]);
+                 pass.set_vertex_buffer(0, self.entity_buffer.slice(..));
+                 pass.draw_indexed(
+@@ -5106,22 +5194,27 @@ impl Renderer {
+                 pass.set_bind_group(0, &self.group, &[]);
+             }
+             if additive_quads > 0 {
+-                pass.set_pipeline(&self.additive_pipeline);
++                pass.set_pipeline(self.scene_pipeline(&self.additive_pipeline, scene_hdr));
+                 pass.set_bind_group(0, &self.entity_group, &[]);
+                 pass.set_vertex_buffer(0, self.entity_buffer.slice(..));
+                 pass.draw_indexed(0..additive_quads * 6, (world_quads * 4) as i32, 0..1);
+                 pass.set_bind_group(0, &self.group, &[]);
+             }
+             if outline_edges > 0 && !frame.outline_after_terrain {
+-                self.draw_outline(&mut pass, outline_edges as u32, frame.outline_high_contrast);
++                self.draw_outline(
++                    &mut pass,
++                    outline_edges as u32,
++                    frame.outline_high_contrast,
++                    scene_hdr,
++                );
+             }
+             if debug_depth > 0 {
+-                pass.set_pipeline(&self.debug_lines);
++                pass.set_pipeline(self.scene_pipeline(&self.debug_lines, scene_hdr));
+                 pass.set_vertex_buffer(0, self.debug_line_buffer.slice(..));
+                 pass.draw(0..4, 0..debug_depth);
+             }
+             if debug_top > 0 {
+-                pass.set_pipeline(&self.debug_lines_on_top);
++                pass.set_pipeline(self.scene_pipeline(&self.debug_lines_on_top, scene_hdr));
+                 pass.set_vertex_buffer(0, self.debug_line_buffer.slice(..));
+                 pass.draw(0..4, debug_depth..debug_depth + debug_top);
+             }
+@@ -5162,7 +5255,7 @@ impl Renderer {
+             // the quads write depth, so before it they would hide the glass
+             // or water behind them.
+             if translucent_particle_quads > 0 {
+-                pass.set_pipeline(&self.entity_pipeline);
++                pass.set_pipeline(self.scene_pipeline(&self.entity_pipeline, scene_hdr));
+                 pass.set_bind_group(0, &self.entity_group, &[]);
+                 pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
+                 pass.set_vertex_buffer(0, self.entity_buffer.slice(..));
+@@ -5177,12 +5270,17 @@ impl Renderer {
+             // LevelRenderer.executeClassicTransparency: translucent targets'
+             // outlines follow terrain, so its blending cannot wash them out.
+             if outline_edges > 0 && frame.outline_after_terrain {
+-                self.draw_outline(&mut pass, outline_edges as u32, frame.outline_high_contrast);
++                self.draw_outline(
++                    &mut pass,
++                    outline_edges as u32,
++                    frame.outline_high_contrast,
++                    scene_hdr,
++                );
+             }
+             pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
+             // LevelRenderer: the world border after translucent terrain and weather.
+             if let Some(b) = frame.border.as_ref().filter(|_| !frame.title) {
+-                pass.set_pipeline(&self.border_pipeline);
++                pass.set_pipeline(self.scene_pipeline(&self.border_pipeline, scene_hdr));
+                 pass.set_bind_group(0, &self.border_group, &[]);
+                 pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
+                 pass.set_vertex_buffer(0, self.border_vertices.slice(..));
+@@ -5193,7 +5291,7 @@ impl Renderer {
+                 pass.set_bind_group(0, &self.group, &[]);
+             }
+             if translucent_crumbling_quads > 0 {
+-                pass.set_pipeline(&self.crumbling_pipeline);
++                pass.set_pipeline(self.scene_pipeline(&self.crumbling_pipeline, scene_hdr));
+                 pass.set_bind_group(0, &self.entity_group, &[]);
+                 pass.set_vertex_buffer(0, self.entity_buffer.slice(..));
+                 pass.draw_indexed(
+@@ -5211,7 +5309,7 @@ impl Renderer {
+                         && !frame.nether_lighting
+                 })
+             {
+-                pass.set_pipeline(&self.cloud_pipeline);
++                pass.set_pipeline(self.scene_pipeline(&self.cloud_pipeline, scene_hdr));
+                 pass.set_bind_group(0, &self.entity_group, &[]);
+                 pass.set_bind_group(1, &self.cloud_group, &[]);
+                 pass.set_vertex_buffer(0, self.cloud_buffer.slice(..));
+@@ -5219,7 +5317,7 @@ impl Renderer {
+             }
+             // LevelRenderer.executeSeeThrough, after the rest of the world.
+             if see_through_quads > 0 {
+-                pass.set_pipeline(&self.see_through_pipeline);
++                pass.set_pipeline(self.scene_pipeline(&self.see_through_pipeline, scene_hdr));
+                 pass.set_bind_group(0, &self.entity_group, &[]);
+                 pass.set_vertex_buffer(0, self.entity_buffer.slice(..));
+                 pass.draw_indexed(
+@@ -5364,7 +5462,7 @@ impl Renderer {
+                 }),
+                 ..Default::default()
+             });
+-            self.native_entity_pipeline(&mut pass, true);
++            self.native_entity_pipeline(&mut pass, true, frame.title);
+             pass.set_bind_group(0, &self.hand_group, &[]);
+             pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
+             pass.set_vertex_buffer(0, self.entity_buffer.slice(..));
+@@ -6040,6 +6138,13 @@ mod tests {
+         assert!(files.len() >= 10, "{files:?}");
+         for path in files {
+             let text = std::fs::read_to_string(&path).unwrap();
++            // The local caster is a fragment of the terrain program, not a
++            // standalone module. Validate the same composition the GPU uses.
++            let text = if path.ends_with("native_shadow.wgsl") {
++                super::native_material::vanilla_terrain() + "\n" + &text
++            } else {
++                text
++            };
+             // entity.wgsl comes after the overlay's constants (entity_shader).
+             let module = naga::front::wgsl::parse_str(&text)
+                 .or_else(|_| {
+diff --git a/crates/horizon-client-render/src/gfx/native_entity.rs b/crates/horizon-client-render/src/gfx/native_entity.rs
+index 16a92cf..6f3a784 100644
+--- a/crates/horizon-client-render/src/gfx/native_entity.rs
++++ b/crates/horizon-client-render/src/gfx/native_entity.rs
+@@ -87,6 +87,22 @@ pub(super) fn shader_source(stage: &CheckedStage) -> String {
+         color = vec4(custom.rgb, color.a);
+     }
+     if in.overlay == 7u", 1);
++    if stage.scene_hdr {
++        engine = engine.replace("    color *= in.light_color;", "    color *= in.light_color;\n    let legacy_colour = color;\n    color = vec4(horizon_srgb_to_linear(color.rgb), color.a);");
++        engine = engine.replace(
++            "EntityInput(albedo, color,",
++            "EntityInput(albedo, legacy_colour,",
++        );
++        engine = engine.replace(
++            "color.rgb + g.rgb * g.rgb",
++            "color.rgb + horizon_srgb_to_linear(g.rgb * g.rgb)",
++        );
++        engine = engine.replace("return vec4(mix(color.rgb, globals.fog_color.rgb, f * globals.fog_color.a), color.a);", "let radiance = mix(color.rgb, horizon_srgb_to_linear(globals.fog_color.rgb), f * globals.fog_color.a);\n    if NATIVE_HAND { return vec4(display(radiance), color.a); }\n    return vec4(radiance, color.a);");
++        engine = engine.replace(
++            "return vec4(color.rgb, color.a * (1.0 - linear_fog",
++            "return vec4(horizon_srgb_to_linear(color.rgb), color.a * (1.0 - linear_fog",
++        );
++    }
+     format!(
+         "{}\n{}",
+         stage.source,
+@@ -159,7 +175,11 @@ impl NativeEntity {
+                     entry_point: Some("horizon_entity_fs_entity"),
+                     compilation_options: options,
+                     targets: &[Some(wgpu::ColorTargetState {
+-                        format,
++                        format: if stage.scene_hdr && !hand {
++                            super::native_hdr::FORMAT
++                        } else {
++                            format
++                        },
+                         blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                         write_mask: wgpu::ColorWrites::ALL,
+                     })],
+diff --git a/crates/horizon-client-render/src/gfx/native_entity_gpu.rs b/crates/horizon-client-render/src/gfx/native_entity_gpu.rs
+index b8f7fcd..c1e2a1f 100644
+--- a/crates/horizon-client-render/src/gfx/native_entity_gpu.rs
++++ b/crates/horizon-client-render/src/gfx/native_entity_gpu.rs
+@@ -5,9 +5,15 @@ use bytemuck::Zeroable;
+ use wgpu::util::DeviceExt;
+ 
+ pub(super) fn stage(body: &str) -> CheckedStage {
++    stage_for_api(body, "0.1-aurora-lighting.2")
++}
++
++fn stage_for_api(body: &str, api: &str) -> CheckedStage {
+     let manifest = "schema=1\nid=\"entity_probe\"\nname=\"Probe\"\nversion=\"1\"\napi=\"0.1-aurora-lighting.2\"\n[sun_shadows]\nquality=\"low\"\n[material]\nfile=\"m.wgsl\"\n[entity]\nfile=\"e.wgsl\"\n[[post]]\nfile=\"p.wgsl\"\n";
++    let manifest = manifest.replace("0.1-aurora-lighting.2", api) + "\n[sky]\nfile=\"s.wgsl\"\n";
+     let files = [
+-        (horizon_shader_api::MANIFEST, manifest),
++        (horizon_shader_api::MANIFEST, manifest.as_str()),
++        ("s.wgsl", "fn sky(i: SkyInput)->vec4<f32>{return i.color;}"),
+         (
+             "m.wgsl",
+             "fn material(i: MaterialInput) -> Surface { return Surface(i.albedo, false); }",
+@@ -292,5 +298,18 @@ fn model_hook_contract_on_gpu() {
+             );
+         }
+     }
++    // The HDR hand is drawn after the world post. It must apply exactly one
++    // pack display transform, while its companion world pipeline targets FP16.
++    let hdr = NativeEntity::new(&device, &layout, &frame, None,
++        &stage_for_api("fn display(c:vec3<f32>)->vec3<f32>{return c*0.25;} fn entity(i:EntityInput)->vec4<f32>{return vec4(4.0,2.0,1.0,1.0);}", "0.1-aurora-hdr.1"), &[], wgpu::TextureFormat::Rgba8Unorm).unwrap();
++    let hand_hdr = render(&hdr.hand);
++    assert!(
++        hand_hdr[0][..3]
++            .iter()
++            .zip([255u8, 128, 64])
++            .all(|(a, b)| a.abs_diff(b) <= 1),
++        "HDR hand mapped once: {:?}",
++        hand_hdr[0]
++    );
+     assert!(pollster::block_on(scope.pop()).is_none());
+ }
+diff --git a/crates/horizon-client-render/src/gfx/native_hdr.rs b/crates/horizon-client-render/src/gfx/native_hdr.rs
+new file mode 100644
+index 0000000..c023d6c
+--- /dev/null
++++ b/crates/horizon-client-render/src/gfx/native_hdr.rs
+@@ -0,0 +1,213 @@
++//! Opt-in FP16 scene variants. SDR pipelines and UI stay byte-for-byte separate.
++//! Legacy world fragments are decoded at their output boundary; this preserves
++//! their authored appearance while blending them with linear pack radiance.
++use std::{cell::RefCell, collections::HashMap};
++
++pub const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
++
++#[derive(Default)]
++pub struct Pipelines {
++    variants: HashMap<wgpu::RenderPipeline, wgpu::RenderPipeline>,
++}
++impl Pipelines {
++    pub fn enabled(&self) -> bool {
++        !self.variants.is_empty()
++    }
++    pub fn get<'a>(&'a self, pipeline: &'a wgpu::RenderPipeline) -> &'a wgpu::RenderPipeline {
++        self.variants
++            .get(pipeline)
++            .expect("registered HDR world pipeline")
++    }
++}
++
++pub struct Builder {
++    enabled: bool,
++    variants: RefCell<HashMap<wgpu::RenderPipeline, wgpu::RenderPipeline>>,
++}
++impl Builder {
++    pub fn new(enabled: bool) -> Self {
++        Self {
++            enabled,
++            variants: RefCell::new(HashMap::new()),
++        }
++    }
++    pub fn module(&self, device: &wgpu::Device, source: &str) -> Option<wgpu::ShaderModule> {
++        self.enabled.then(|| {
++            device.create_shader_module(wgpu::ShaderModuleDescriptor {
++                label: Some("Aurora linear legacy world fragments"),
++                source: wgpu::ShaderSource::Wgsl(
++                    linear_source(source)
++                        .expect("validated legacy colour shader")
++                        .into(),
++                ),
++            })
++        })
++    }
++    pub fn create(
++        &self,
++        device: &wgpu::Device,
++        descriptor: &wgpu::RenderPipelineDescriptor<'_>,
++        linear: Option<&wgpu::ShaderModule>,
++    ) -> wgpu::RenderPipeline {
++        let base = device.create_render_pipeline(descriptor);
++        if let Some(linear) = linear {
++            let mut hdr = descriptor.clone();
++            let fragment = hdr.fragment.as_mut().expect("world colour fragment");
++            fragment.module = linear;
++            let targets: Vec<_> = fragment
++                .targets
++                .iter()
++                .map(|t| {
++                    t.clone().map(|mut t| {
++                        t.format = FORMAT;
++                        t
++                    })
++                })
++                .collect();
++            fragment.targets = &targets;
++            let pipeline = device.create_render_pipeline(&hdr);
++            self.variants.borrow_mut().insert(base.clone(), pipeline);
++        }
++        base
++    }
++    pub fn finish(self) -> Pipelines {
++        Pipelines {
++            variants: self.variants.into_inner(),
++        }
++    }
++}
++
++/// Move each legacy fragment into an ordinary function and wrap its final RGBA.
++/// Naga handles early returns/discard/control flow; no textual return rewriting.
++/// Only the renderer's RGBA colour shaders go through this adapter, never packs.
++fn linear_source(source: &str) -> Result<String, String> {
++    let mut module = naga::front::wgsl::parse_str(source).map_err(|e| e.emit_to_string(source))?;
++    let mut wrappers = String::new();
++    let entries = std::mem::take(&mut module.entry_points);
++    for entry in entries {
++        if entry.stage != naga::ShaderStage::Fragment {
++            module.entry_points.push(entry);
++            continue;
++        }
++        let result = entry
++            .function
++            .result
++            .as_ref()
++            .ok_or("fragment without colour")?;
++        if !matches!(
++            module.types[result.ty].inner,
++            naga::TypeInner::Vector {
++                size: naga::VectorSize::Quad,
++                scalar: naga::Scalar {
++                    kind: naga::ScalarKind::Float,
++                    width: 4
++                }
++            }
++        ) {
++            return Err(format!("{} is not an RGBA fragment", entry.name));
++        }
++        let mut parameters = Vec::new();
++        let mut arguments = Vec::new();
++        for (i, arg) in entry.function.arguments.iter().enumerate() {
++            let ty = &module.types[arg.ty];
++            let name = match (&ty.name, &ty.inner) {
++                (Some(name), _) => name.clone(),
++                (
++                    _,
++                    naga::TypeInner::Scalar(naga::Scalar {
++                        kind: naga::ScalarKind::Bool,
++                        ..
++                    }),
++                ) => "bool".into(),
++                (
++                    _,
++                    naga::TypeInner::Vector {
++                        size: naga::VectorSize::Quad,
++                        scalar:
++                            naga::Scalar {
++                                kind: naga::ScalarKind::Float,
++                                width: 4,
++                            },
++                    },
++                ) => "vec4<f32>".into(),
++                _ => return Err(format!("unsupported colour fragment input: {:?}", ty.inner)),
++            };
++            let binding = match &arg.binding {
++                None => "",
++                Some(naga::Binding::BuiltIn(naga::BuiltIn::FrontFacing)) => {
++                    "@builtin(front_facing) "
++                }
++                Some(naga::Binding::BuiltIn(naga::BuiltIn::Position { .. })) => {
++                    "@builtin(position) "
++                }
++                _ => return Err("unsupported colour fragment binding".into()),
++            };
++            parameters.push(format!("{binding}arg{i}: {name}"));
++            arguments.push(format!("arg{i}"));
++        }
++        let helper = format!("aurora_legacy_{}", entry.name);
++        wrappers += &format!(
++            "\n@fragment fn {}({}) -> @location(0) vec4<f32> {{ return aurora_decode_legacy({}({})); }}\n",
++            entry.name,
++            parameters.join(", "),
++            helper,
++            arguments.join(", ")
++        );
++        let mut function = entry.function;
++        function.name = Some(helper);
++        for arg in &mut function.arguments {
++            arg.binding = None;
++        }
++        function.result.as_mut().unwrap().binding = None;
++        module.functions.append(function, naga::Span::UNDEFINED);
++    }
++    let info = naga::valid::Validator::new(
++        naga::valid::ValidationFlags::all(),
++        naga::valid::Capabilities::all(),
++    )
++    .validate(&module)
++    .map_err(|e| e.to_string())?;
++    let mut text = naga::back::wgsl::write_string(
++        &module,
++        &info,
++        naga::back::wgsl::WriterFlags::EXPLICIT_TYPES,
++    )
++    .map_err(|e| e.to_string())?;
++    text += "\nfn aurora_decode_legacy(c: vec4<f32>) -> vec4<f32> { let p = max(c.rgb, vec3(0.0)); return vec4(select(pow((p + 0.055) / 1.055, vec3(2.4)), p / 12.92, p <= vec3(0.04045)), c.a); }\n";
++    text += &wrappers;
++    Ok(text)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn legacy_hdr_fragments_keep_valid_interfaces() {
++        for source in [
++            include_str!("../terrain.wgsl").to_owned(),
++            super::super::entity_shader(),
++            include_str!("../border.wgsl").to_owned(),
++            include_str!("stars.wgsl").to_owned(),
++        ] {
++            let converted = linear_source(&source).unwrap();
++            let module = naga::front::wgsl::parse_str(&converted)
++                .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&converted)));
++            naga::valid::Validator::new(
++                naga::valid::ValidationFlags::all(),
++                naga::valid::Capabilities::all(),
++            )
++            .validate(&module)
++            .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&converted)));
++            let original = naga::front::wgsl::parse_str(&source).unwrap();
++            assert_eq!(module.entry_points.len(), original.entry_points.len());
++            for old in original
++                .entry_points
++                .iter()
++                .filter(|e| e.stage == naga::ShaderStage::Fragment)
++            {
++                assert!(module.entry_points.iter().any(|e| e.name == old.name
++                    && e.function.arguments.len() == old.function.arguments.len()));
++            }
++        }
++    }
++}
+diff --git a/crates/horizon-client-render/src/gfx/native_hdr_gpu.rs b/crates/horizon-client-render/src/gfx/native_hdr_gpu.rs
+new file mode 100644
+index 0000000..0fa0590
+--- /dev/null
++++ b/crates/horizon-client-render/src/gfx/native_hdr_gpu.rs
+@@ -0,0 +1,193 @@
++//! Runs inside native_scene to inspect the real pre-translucent snapshot.
++use super::super::{native_hdr, native_post::NativePost, world_post};
++use super::*;
++use horizon_shader_api::{MANIFEST, Pack, check};
++
++#[test]
++fn hdr_blend_snapshot_post_and_format_switch_on_gpu() {
++    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
++    let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
++        assert!(
++            std::env::var_os("AURORA_REQUIRE_GPU").is_none(),
++            "Metal adapter required for HDR readback"
++        );
++        eprintln!("SKIP HDR readback: no GPU adapter");
++        return;
++    };
++    eprintln!("HDR readback GPU: {:?}", adapter.get_info());
++    let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
++    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
++    let sdr = wgpu::TextureFormat::Rgba8Unorm;
++    let mut world = world_post::Post::new(&device, sdr);
++    let frame = NativeFrame::new(&device);
++    let manifest = "schema=1\nid=\"hdr_readback\"\nname=\"HDR readback\"\nversion=\"1\"\napi=\"0.1\"\n[[post]]\nfile=\"p.wgsl\"\n[[post]]\nfile=\"q.wgsl\"\n";
++    let shader = "fn post(i:PostInput)->vec4<f32>{return vec4(i.color.rgb*0.5,1.0);}";
++    let report = check(
++        &Pack::from_files(
++            [(MANIFEST, manifest), ("p.wgsl", shader), ("q.wgsl", shader)]
++                .map(|(n, s)| (n.into(), s.as_bytes().to_vec()))
++                .into(),
++        )
++        .unwrap(),
++    )
++    .unwrap();
++    let mut post = NativePost::new(&device, report.stages, &[], sdr, &frame).unwrap();
++    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
++        label: Some("HDR linear blend probe"),
++        source: wgpu::ShaderSource::Wgsl("@vertex fn vs(@builtin(vertex_index)i:u32)->@builtin(position)vec4<f32>{let p=vec2<f32>(f32((i<<1u)&2u),f32(i&2u));return vec4(p*2.0-1.0,0.0,1.0);}\n@fragment fn fs()->@location(0)vec4<f32>{return vec4(2.0,0.75,0.0,0.5);}".into()),
++    });
++    // Same size on the first switch catches a format-only cache miss;
++    // the last switch also exercises resize and rebind of the snapshot/post.
++    for (hdr, size, want) in [
++        (true, [5, 3], [191, 32, 16]),
++        (false, [5, 3], [64, 32, 16]),
++        (true, [7, 5], [191, 32, 16]),
++    ] {
++        let format = if hdr { native_hdr::FORMAT } else { sdr };
++        post.world_format = format;
++        let (color, depth) = world.prepare(&device, size, true, hdr).unwrap();
++        let mut snapshot = NativeScene::new(&device, format);
++        snapshot.prepare(&device, &frame, (&color, &depth), size, None);
++        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
++            label: Some("HDR blend"),
++            layout: None,
++            vertex: wgpu::VertexState {
++                module: &module,
++                entry_point: Some("vs"),
++                compilation_options: Default::default(),
++                buffers: &[],
++            },
++            primitive: Default::default(),
++            depth_stencil: None,
++            multisample: Default::default(),
++            fragment: Some(wgpu::FragmentState {
++                module: &module,
++                entry_point: Some("fs"),
++                compilation_options: Default::default(),
++                targets: &[Some(wgpu::ColorTargetState {
++                    format,
++                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
++                    write_mask: wgpu::ColorWrites::ALL,
++                })],
++            }),
++            multiview_mask: None,
++            cache: None,
++        });
++        let mut encoder = device.create_command_encoder(&Default::default());
++        {
++            let _clear = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
++                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
++                    view: &color,
++                    resolve_target: None,
++                    depth_slice: None,
++                    ops: wgpu::Operations {
++                        load: wgpu::LoadOp::Clear(wgpu::Color {
++                            r: 4.0,
++                            g: 0.25,
++                            b: 0.5,
++                            a: 1.0,
++                        }),
++                        store: wgpu::StoreOp::Store,
++                    },
++                })],
++                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
++                    view: &depth,
++                    depth_ops: Some(wgpu::Operations {
++                        load: wgpu::LoadOp::Clear(0.25),
++                        store: wgpu::StoreOp::Store,
++                    }),
++                    stencil_ops: None,
++                }),
++                ..Default::default()
++            });
++        }
++        {
++            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
++                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
++                    view: &color,
++                    resolve_target: None,
++                    depth_slice: None,
++                    ops: wgpu::Operations {
++                        load: wgpu::LoadOp::Load,
++                        store: wgpu::StoreOp::Store,
++                    },
++                })],
++                ..Default::default()
++            });
++            pass.set_pipeline(&pipeline);
++            pass.draw(0..3, 0..1);
++        }
++        snapshot.capture(&mut encoder);
++        // Overwrite the source: the post below must still see the captured HDR blend.
++        {
++            let _clear = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
++                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
++                    view: &color,
++                    resolve_target: None,
++                    depth_slice: None,
++                    ops: wgpu::Operations {
++                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
++                        store: wgpu::StoreOp::Store,
++                    },
++                })],
++                ..Default::default()
++            });
++        }
++        let output = device.create_texture(&wgpu::TextureDescriptor {
++            label: None,
++            size: wgpu::Extent3d {
++                width: size[0],
++                height: size[1],
++                depth_or_array_layers: 1,
++            },
++            mip_level_count: 1,
++            sample_count: 1,
++            dimension: wgpu::TextureDimension::D2,
++            format: sdr,
++            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
++            view_formats: &[],
++        });
++        let targets = snapshot.targets.as_ref().unwrap();
++        post.run(
++            &device,
++            &mut encoder,
++            (&targets.color, &targets.depth),
++            &output.create_view(&Default::default()),
++            size,
++            None,
++        );
++        let read = device.create_buffer(&wgpu::BufferDescriptor {
++            label: None,
++            size: u64::from(256 * size[1]),
++            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
++            mapped_at_creation: false,
++        });
++        encoder.copy_texture_to_buffer(
++            output.as_image_copy(),
++            wgpu::TexelCopyBufferInfo {
++                buffer: &read,
++                layout: wgpu::TexelCopyBufferLayout {
++                    offset: 0,
++                    bytes_per_row: Some(256),
++                    rows_per_image: Some(size[1]),
++                },
++            },
++            output.size(),
++        );
++        queue.submit([encoder.finish()]);
++        read.slice(..)
++            .map_async(wgpu::MapMode::Read, |r| r.unwrap());
++        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
++        let bytes = read.slice(..).get_mapped_range().unwrap();
++        for y in 0..size[1] as usize {
++            for x in 0..size[0] as usize {
++                let pixel = &bytes[y * 256 + x * 4..y * 256 + x * 4 + 3];
++                assert!(
++                    pixel.iter().zip(want).all(|(a, b)| a.abs_diff(b) <= 1),
++                    "HDR={hdr}, size={size:?}: {pixel:?} != {want:?}"
++                );
++            }
++        }
++    }
++    assert!(pollster::block_on(scope.pop()).is_none());
++}
+diff --git a/crates/horizon-client-render/src/gfx/native_material.rs b/crates/horizon-client-render/src/gfx/native_material.rs
+index a154c96..ac8092e 100644
+--- a/crates/horizon-client-render/src/gfx/native_material.rs
++++ b/crates/horizon-client-render/src/gfx/native_material.rs
+@@ -154,11 +154,20 @@ fn horizon_material_fog(in: HorizonMaterialOut) -> vec4<f32> {
+     if stage.forest {
+         entries = entries.replace("in.lighting));", "in.lighting, in.is_leaves != 0u));");
+     }
++    let mut terrain = vanilla_terrain();
++    if stage.scene_hdr {
++        terrain = terrain.replace(
++            "mix(color.rgb, horizon_terrain_globals.fog_color.rgb,",
++            "mix(color.rgb, horizon_srgb_to_linear(horizon_terrain_globals.fog_color.rgb),",
++        );
++        entries = entries.replace(
++            "vec4(horizon_terrain_globals.fog_color.rgb,",
++            "vec4(horizon_srgb_to_linear(horizon_terrain_globals.fog_color.rgb),",
++        );
++    }
+     format!(
+         "{}\n// Horizon's terrain (terrain.wgsl)\n{}{}",
+-        stage.source,
+-        vanilla_terrain(),
+-        entries
++        stage.source, terrain, entries
+     )
+ }
+ 
+diff --git a/crates/horizon-client-render/src/gfx/native_pack.rs b/crates/horizon-client-render/src/gfx/native_pack.rs
+index 7c76827..339c847 100644
+--- a/crates/horizon-client-render/src/gfx/native_pack.rs
++++ b/crates/horizon-client-render/src/gfx/native_pack.rs
+@@ -9,6 +9,7 @@ use super::native_sky::NativeSky;
+ use super::pack_timing::PassTiming;
+ 
+ pub struct NativePack {
++    pub scene_hdr: bool,
+     pub atmosphere: horizon_shader_api::manifest::Atmosphere,
+     pub water_environment: bool,
+     pub frame: NativeFrame,
+@@ -33,6 +34,16 @@ impl NativePack {
+         constants: &[(String, f64)],
+     ) -> Result<(Self, Vec<String>), String> {
+         let (globals, format) = (terrain.globals, terrain.format);
++        let scene_hdr = report.scene_hdr;
++        let terrain = TerrainShape {
++            format: if scene_hdr {
++                super::native_hdr::FORMAT
++            } else {
++                format
++            },
++            ..*terrain
++        };
++        let world_format = terrain.format;
+         let frame = NativeFrame::new(device);
+         let water_environment = report.water_environment;
+         let (post, others): (Vec<_>, Vec<_>) = report
+@@ -42,12 +53,12 @@ impl NativePack {
+         let sky = others
+             .iter()
+             .find(|s| s.kind == StageKind::Sky)
+-            .map(|stage| NativeSky::new(device, globals, &frame, stage, constants, format))
++            .map(|stage| NativeSky::new(device, globals, &frame, stage, constants, world_format))
+             .transpose()?;
+         let material = others
+             .iter()
+             .find(|s| s.kind == StageKind::Material)
+-            .map(|stage| NativeMaterial::new(device, terrain, &frame, stage, constants))
++            .map(|stage| NativeMaterial::new(device, &terrain, &frame, stage, constants))
+             .transpose()?;
+         let entity = others
+             .iter()
+@@ -64,7 +75,7 @@ impl NativePack {
+                 )
+             })
+             .transpose()?;
+-        let post = (!post.is_empty())
++        let mut post = (!post.is_empty())
+             .then(|| {
+                 if post.iter().any(|s| s.sun_shadow) {
+                     NativePost::with_shadow(
+@@ -80,6 +91,9 @@ impl NativePack {
+                 }
+             })
+             .transpose()?;
++        if let Some(post) = &mut post {
++            post.world_format = world_format;
++        }
+         let mut labels: Vec<String> = sky.iter().map(|s| s.label.clone()).collect();
+         labels.extend(
+             others
+@@ -97,6 +111,7 @@ impl NativePack {
+             labels.extend(post.labels().into_iter().map(str::to_owned));
+         }
+         let pack = Self {
++            scene_hdr,
+             atmosphere: report.atmosphere,
+             water_environment,
+             frame,
+diff --git a/crates/horizon-client-render/src/gfx/native_post.rs b/crates/horizon-client-render/src/gfx/native_post.rs
+index 240665c..92a3fec 100644
+--- a/crates/horizon-client-render/src/gfx/native_post.rs
++++ b/crates/horizon-client-render/src/gfx/native_post.rs
+@@ -31,8 +31,8 @@ pub struct NativePost {
+     targets: Option<([u32; 2], [wgpu::TextureView; 2])>,
+     /// One bind group per pass, for these world views.
+     groups: Option<(WorldViews, Vec<wgpu::BindGroup>)>,
+-    /// The screen's colour format, the world target's too.
+-    format: wgpu::TextureFormat,
++    /// Input world format (FP16 for hdr.1); final output uses the screen format.
++    pub(super) world_format: wgpu::TextureFormat,
+ }
+ 
+ /// The `frame` every stage of a pack reads (group 3, binding 0), written once a frame.
+@@ -285,7 +285,7 @@ impl NativePost {
+             nearest: sampler("Native shader pack nearest", wgpu::FilterMode::Nearest),
+             targets: None,
+             groups: None,
+-            format,
++            world_format: format,
+         })
+     }
+ 
+@@ -422,7 +422,7 @@ impl NativePost {
+         }
+         self.prepare(device, world, size);
+         if let Some(t) = timing.as_deref_mut() {
+-            t.mark(device, encoder, (world.0, self.format));
++            t.mark(device, encoder, (world.0, self.world_format));
+         }
+         let Some((_, groups)) = &self.groups else {
+             return;
+diff --git a/crates/horizon-client-render/src/gfx/native_post/temporal.rs b/crates/horizon-client-render/src/gfx/native_post/temporal.rs
+index c904257..b66b5dd 100644
+--- a/crates/horizon-client-render/src/gfx/native_post/temporal.rs
++++ b/crates/horizon-client-render/src/gfx/native_post/temporal.rs
+@@ -305,7 +305,7 @@ impl TemporalPost {
+             }),
+         );
+         if let Some(t) = timing.as_deref_mut() {
+-            t.mark(device, encoder, (world.0, parent.format));
++            t.mark(device, encoder, (world.0, parent.world_format));
+         }
+         let r = self.resources.as_ref().unwrap();
+         for (i, (label, pipeline)) in parent.passes.iter().enumerate() {
+diff --git a/crates/horizon-client-render/src/gfx/native_scene.rs b/crates/horizon-client-render/src/gfx/native_scene.rs
+index 3df6091..6470d64 100644
+--- a/crates/horizon-client-render/src/gfx/native_scene.rs
++++ b/crates/horizon-client-render/src/gfx/native_scene.rs
+@@ -5,6 +5,10 @@
+ 
+ use super::native_post::{NativeFrame, frame_entry, sampler_entry, texture_entry};
+ 
++#[cfg(test)]
++#[path = "native_hdr_gpu.rs"]
++mod hdr_gpu_tests;
++
+ const COPY: &str = "
+ @group(0) @binding(1) var color: texture_2d<f32>;
+ @group(0) @binding(2) var depth: texture_depth_2d;
+diff --git a/crates/horizon-client-render/src/gfx/stars.rs b/crates/horizon-client-render/src/gfx/stars.rs
+index 2c686c3..8b98159 100644
+--- a/crates/horizon-client-render/src/gfx/stars.rs
++++ b/crates/horizon-client-render/src/gfx/stars.rs
+@@ -57,7 +57,11 @@ pub(super) struct Stars {
+ }
+ 
+ impl Stars {
+-    pub(super) fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
++    pub(super) fn new_with_hdr(
++        device: &wgpu::Device,
++        format: wgpu::TextureFormat,
++        hdr: Option<&super::native_hdr::Builder>,
++    ) -> Self {
+         let triangles = star_triangles();
+         let vertices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+             label: Some("Stars vertex buffer"),
+@@ -101,7 +105,7 @@ impl Stars {
+             ..Default::default()
+         });
+         let attributes = wgpu::vertex_attr_array![0 => Float32x3];
+-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
++        let descriptor = &wgpu::RenderPipelineDescriptor {
+             label: Some("Stars"),
+             layout: Some(&pipeline_layout),
+             vertex: wgpu::VertexState {
+@@ -146,7 +150,12 @@ impl Stars {
+             }),
+             multiview_mask: None,
+             cache: None,
+-        });
++        };
++        let linear = hdr.and_then(|b| b.module(device, include_str!("stars.wgsl")));
++        let pipeline = match hdr {
++            Some(b) => b.create(device, descriptor, linear.as_ref()),
++            None => device.create_render_pipeline(descriptor),
++        };
+         Self {
+             pipeline,
+             group,
+@@ -173,8 +182,12 @@ impl Stars {
+         uploads.buffer(encoder, &self.uniform, 0, bytemuck::bytes_of(&uniform));
+     }
+ 
+-    pub(super) fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
+-        pass.set_pipeline(&self.pipeline);
++    pub(super) fn draw_with_hdr(
++        &self,
++        pass: &mut wgpu::RenderPass<'_>,
++        hdr: Option<&super::native_hdr::Pipelines>,
++    ) {
++        pass.set_pipeline(hdr.map_or(&self.pipeline, |h| h.get(&self.pipeline)));
+         pass.set_bind_group(0, &self.group, &[]);
+         pass.set_vertex_buffer(0, self.vertices.slice(..));
+         pass.draw(0..self.count, 0..1);
+diff --git a/crates/horizon-client-render/src/gfx/weather.rs b/crates/horizon-client-render/src/gfx/weather.rs
+index 15886b8..260e097 100644
+--- a/crates/horizon-client-render/src/gfx/weather.rs
++++ b/crates/horizon-client-render/src/gfx/weather.rs
+@@ -10,11 +10,12 @@ pub(super) struct Weather {
+     count: u32,
+ }
+ impl Weather {
+-    pub fn new(
++    pub fn new_with_hdr(
+         device: &wgpu::Device,
+         format: wgpu::TextureFormat,
+         entities: &wgpu::BindGroupLayout,
+         shader: &wgpu::ShaderModule,
++        hdr: Option<&super::native_hdr::Builder>,
+     ) -> Self {
+         let bindings = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+             label: Some("Weather time"),
+@@ -36,7 +37,7 @@ impl Weather {
+         });
+         let attributes = wgpu::vertex_attr_array![0=>Float32x3,1=>Float32x2,2=>Float32x4,
+             3=>Float32x4,4=>Uint32x4,5=>Unorm8x4,6=>Uint8x4,7=>Uint32];
+-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
++        let descriptor = &wgpu::RenderPipelineDescriptor {
+             label: Some("Weather"),
+             layout: Some(&layout),
+             vertex: wgpu::VertexState {
+@@ -73,7 +74,12 @@ impl Weather {
+             }),
+             multiview_mask: None,
+             cache: None,
+-        });
++        };
++        let linear = hdr.and_then(|b| b.module(device, &super::entity_shader()));
++        let pipeline = match hdr {
++            Some(b) => b.create(device, descriptor, linear.as_ref()),
++            None => device.create_render_pipeline(descriptor),
++        };
+         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+             label: Some("Weather time"),
+             size: 16,
+@@ -124,11 +130,16 @@ impl Weather {
+         uploads.buffer(encoder, &self.vertices, 0, bytemuck::cast_slice(vertices));
+         uploads.buffer(encoder, &self.uniform, 0, bytemuck::bytes_of(&time));
+     }
+-    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, entities: &wgpu::BindGroup) {
++    pub fn draw_with_hdr(
++        &self,
++        pass: &mut wgpu::RenderPass<'_>,
++        entities: &wgpu::BindGroup,
++        hdr: Option<&super::native_hdr::Pipelines>,
++    ) {
+         if self.count == 0 {
+             return;
+         }
+-        pass.set_pipeline(&self.pipeline);
++        pass.set_pipeline(hdr.map_or(&self.pipeline, |h| h.get(&self.pipeline)));
+         pass.set_bind_group(0, entities, &[]);
+         pass.set_bind_group(1, &self.group, &[]);
+         pass.set_vertex_buffer(0, self.vertices.slice(..));
+diff --git a/crates/horizon-client-render/src/gfx/world_post.rs b/crates/horizon-client-render/src/gfx/world_post.rs
+index a923f2f..3997f47 100644
+--- a/crates/horizon-client-render/src/gfx/world_post.rs
++++ b/crates/horizon-client-render/src/gfx/world_post.rs
+@@ -15,6 +15,7 @@ const HISTORY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+ 
+ struct WorldTarget {
+     size: [u32; 2],
++    format: wgpu::TextureFormat,
+     color: wgpu::TextureView,
+     depth: wgpu::TextureView,
+     group: wgpu::BindGroup,
+@@ -307,18 +308,22 @@ impl Post {
+         device: &wgpu::Device,
+         window: [u32; 2],
+         always: bool,
++        scene_hdr: bool,
+     ) -> Option<(wgpu::TextureView, wgpu::TextureView)> {
+         if self.scale == 1.0 && !self.antialias && !self.taa_on && !always {
+             self.target = None;
+             return None;
+         }
+         let (size, output) = self.sizes(window);
++        let format = if scene_hdr {
++            super::native_hdr::FORMAT
++        } else {
++            self.format
++        };
+         let history_size = self.taa_on.then_some(output);
+-        if self
+-            .target
+-            .as_ref()
+-            .is_none_or(|t| t.size != size || t.taa.as_ref().map(|h| h.size) != history_size)
+-        {
++        if self.target.as_ref().is_none_or(|t| {
++            t.size != size || t.format != format || t.taa.as_ref().map(|h| h.size) != history_size
++        }) {
+             let make_tex = |label, size: [u32; 2], format, usage| {
+                 device.create_texture(&wgpu::TextureDescriptor {
+                     label: Some(label),
+@@ -337,8 +342,8 @@ impl Post {
+             };
+             let sampled =
+                 wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
+-            let color = make_tex("Scaled world", size, self.format, sampled)
+-                .create_view(&Default::default());
++            let color =
++                make_tex("Scaled world", size, format, sampled).create_view(&Default::default());
+             // TEXTURE_BINDING: occlusion culling and TAA read it.
+             let depth = make_tex(
+                 "Scaled world depth",
+@@ -394,6 +399,7 @@ impl Post {
+             self.taa_this_frame.jitter[2] = 1.0;
+             self.target = Some(WorldTarget {
+                 size,
++                format,
+                 color,
+                 depth,
+                 group,
+diff --git a/crates/horizon-shader-api/src/check.rs b/crates/horizon-shader-api/src/check.rs
+index 305b195..e30c353 100644
+--- a/crates/horizon-shader-api/src/check.rs
++++ b/crates/horizon-shader-api/src/check.rs
+@@ -58,6 +58,7 @@ pub struct CheckedStage {
+     pub temporal_api: bool,
+     pub clean_lighting: bool,
+     pub forest: bool,
++    pub scene_hdr: bool,
+     pub resolution_divisor: u32,
+     pub history: bool,
+     /// The opt-in water.2 material stage needs a pre-translucent scene snapshot.
+@@ -79,6 +80,7 @@ pub struct CheckedStage {
+ 
+ #[derive(Debug)]
+ pub struct Report {
++    pub scene_hdr: bool,
+     pub atmosphere: crate::manifest::Atmosphere,
+     pub water_environment: bool,
+     pub stages: Vec<CheckedStage>,
+@@ -130,6 +132,7 @@ pub fn check(pack: &Pack) -> Result<Report, Vec<Problem>> {
+     }
+     if problems.is_empty() {
+         Ok(Report {
++            scene_hdr: m.api == crate::manifest::AURORA_HDR_API,
+             atmosphere: m.atmosphere.unwrap_or_default(),
+             stages: checked,
+             water_environment: crate::manifest::has_water_environment(&m.api),
+@@ -190,7 +193,8 @@ pub fn check_stage(pack: &Pack, kind: StageKind, file: &str) -> Result<CheckedSt
+         kind,
+         temporal_api: crate::manifest::has_temporal(&pack.manifest.api),
+         clean_lighting: crate::manifest::has_clean_lighting(&pack.manifest.api),
+-        forest: pack.manifest.api == crate::manifest::AURORA_FOREST_API,
++        forest: crate::manifest::has_forest(&pack.manifest.api),
++        scene_hdr: pack.manifest.api == crate::manifest::AURORA_HDR_API,
+         resolution_divisor: post.and_then(|s| s.resolution_divisor).unwrap_or(1),
+         history: post.and_then(|s| s.history).unwrap_or(false),
+         sun_shadow: (matches!(kind, StageKind::Material | StageKind::Entity)
+diff --git a/crates/horizon-shader-api/src/manifest.rs b/crates/horizon-shader-api/src/manifest.rs
+index f1ff9c9..b255e40 100644
+--- a/crates/horizon-shader-api/src/manifest.rs
++++ b/crates/horizon-shader-api/src/manifest.rs
+@@ -28,19 +28,28 @@ pub const AURORA_LIGHTING_API: &str = "0.1-aurora-lighting.1";
+ pub const AURORA_ENTITY_API: &str = "0.1-aurora-lighting.2";
+ /// Local semantic foliage and a same-frame, camera-space opaque depth prepass.
+ pub const AURORA_FOREST_API: &str = "0.1-aurora-forest.1";
++/// Linear FP16 scene and final display transform; local Aurora fork only.
++pub const AURORA_HDR_API: &str = "0.1-aurora-hdr.1";
++pub fn has_forest(api: &str) -> bool {
++    matches!(api, AURORA_FOREST_API | AURORA_HDR_API)
++}
+ pub fn has_entity(api: &str) -> bool {
+-    matches!(api, AURORA_ENTITY_API | AURORA_FOREST_API)
++    matches!(api, AURORA_ENTITY_API | AURORA_FOREST_API | AURORA_HDR_API)
+ }
+ pub fn has_clean_lighting(api: &str) -> bool {
+     matches!(
+         api,
+-        AURORA_LIGHTING_API | AURORA_ENTITY_API | AURORA_FOREST_API
++        AURORA_LIGHTING_API | AURORA_ENTITY_API | AURORA_FOREST_API | AURORA_HDR_API
+     )
+ }
+ pub fn has_temporal(api: &str) -> bool {
+     matches!(
+         api,
+-        AURORA_TEMPORAL_API | AURORA_LIGHTING_API | AURORA_ENTITY_API | AURORA_FOREST_API
++        AURORA_TEMPORAL_API
++            | AURORA_LIGHTING_API
++            | AURORA_ENTITY_API
++            | AURORA_FOREST_API
++            | AURORA_HDR_API
+     )
+ }
+ pub fn has_atmosphere(api: &str) -> bool {
+@@ -51,6 +60,7 @@ pub fn has_atmosphere(api: &str) -> bool {
+             | AURORA_LIGHTING_API
+             | AURORA_ENTITY_API
+             | AURORA_FOREST_API
++            | AURORA_HDR_API
+     )
+ }
+ pub fn has_sun_shadow(api: &str) -> bool {
+@@ -63,6 +73,7 @@ pub fn has_sun_shadow(api: &str) -> bool {
+             | AURORA_LIGHTING_API
+             | AURORA_ENTITY_API
+             | AURORA_FOREST_API
++            | AURORA_HDR_API
+     )
+ }
+ pub fn has_water_environment(api: &str) -> bool {
+@@ -289,15 +300,26 @@ impl Manifest {
+             && raw.api != AURORA_LIGHTING_API
+             && raw.api != AURORA_ENTITY_API
+             && raw.api != AURORA_FOREST_API
++            && raw.api != AURORA_HDR_API
+         {
+             return Err(err(format!(
+-                "written for shader API {}; this Horizon serves {API}, {AURORA_WATER_API}, {AURORA_SCENE_API}, {AURORA_IMMERSION_API}, {AURORA_SHADOW_API}, {AURORA_SHADOW_QUALITY_API}, {AURORA_ATMOSPHERE_API}, {AURORA_TEMPORAL_API}, {AURORA_LIGHTING_API}, {AURORA_ENTITY_API} and {AURORA_FOREST_API}",
++                "written for shader API {}; this Horizon serves {API}, {AURORA_WATER_API}, {AURORA_SCENE_API}, {AURORA_IMMERSION_API}, {AURORA_SHADOW_API}, {AURORA_SHADOW_QUALITY_API}, {AURORA_ATMOSPHERE_API}, {AURORA_TEMPORAL_API}, {AURORA_LIGHTING_API}, {AURORA_ENTITY_API}, {AURORA_FOREST_API} and {AURORA_HDR_API}",
+                 raw.api
+             )));
+         }
+         if raw.entity.is_some() && !has_entity(&raw.api) {
+             return Err(err(
+-                "[entity] requires local API lighting.2 or forest.1".into()
++                "[entity] requires local API lighting.2, forest.1 or hdr.1".into(),
++            ));
++        }
++        if raw.api == AURORA_HDR_API
++            && (raw.sky.is_none()
++                || raw.material.is_none()
++                || raw.entity.is_none()
++                || raw.post.is_empty())
++        {
++            return Err(err(
++                "hdr.1 requires sky, material, entity and final display post stages".into(),
+             ));
+         }
+         let id_ok = (1..=64).contains(&raw.id.len())
+@@ -329,6 +351,7 @@ impl Manifest {
+                 | AURORA_LIGHTING_API
+                 | AURORA_ENTITY_API
+                 | AURORA_FOREST_API
++                | AURORA_HDR_API
+         ) {
+             if raw.sun_shadows.is_none() || raw.material.is_none() {
+                 return Err(err(
+diff --git a/crates/horizon-shader-api/src/scene_hdr.wgsl b/crates/horizon-shader-api/src/scene_hdr.wgsl
+new file mode 100644
+index 0000000..d85f923
+--- /dev/null
++++ b/crates/horizon-shader-api/src/scene_hdr.wgsl
+@@ -0,0 +1,12 @@
++// hdr.1: albedo, vanilla and FrameInputs colour palettes remain display sRGB.
++// MaterialInput.fog.rgb is linear, matching its Surface output for composition.
++// Stage outputs and scene snapshots are linear radiance. Post's final output and
++// the mandatory entity display(colour) function return display sRGB for SDR output.
++fn horizon_srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
++    let p = max(c, vec3(0.0));
++    return select(pow((p + 0.055) / 1.055, vec3(2.4)), p / 12.92, p <= vec3(0.04045));
++}
++fn horizon_linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
++    let p = max(c, vec3(0.0));
++    return select(1.055 * pow(p, vec3(1.0 / 2.4)) - 0.055, p * 12.92, p <= vec3(0.0031308));
++}
+diff --git a/crates/horizon-shader-api/src/stages.rs b/crates/horizon-shader-api/src/stages.rs
+index 75f93fe..0ce39fe 100644
+--- a/crates/horizon-shader-api/src/stages.rs
++++ b/crates/horizon-shader-api/src/stages.rs
+@@ -253,6 +253,9 @@ impl StageKind {
+         quality: crate::manifest::SunShadowQuality,
+     ) -> String {
+         let mut out = self.prelude();
++        if api == crate::manifest::AURORA_HDR_API {
++            out += include_str!("scene_hdr.wgsl");
++        }
+         if crate::manifest::has_water_environment(api) {
+             let frame = Frame::WGSL.wgsl();
+             out = out.replace(&frame, &frame.replacen("}\n",
+@@ -277,7 +280,7 @@ impl StageKind {
+         if self == StageKind::Material && crate::manifest::has_clean_lighting(api) {
+             out = out.replace("    fog: vec4<f32>,", "    fog: vec4<f32>,\n    // RGB: unshaded biome tint; alpha: AO, zero means unavailable.\n    lighting: vec4<f32>,");
+         }
+-        if self == StageKind::Material && api == crate::manifest::AURORA_FOREST_API {
++        if self == StageKind::Material && crate::manifest::has_forest(api) {
+             out = out.replace(
+                 "    lighting: vec4<f32>,",
+                 "    lighting: vec4<f32>,\n    is_leaves: bool,",
+@@ -390,14 +393,36 @@ pub fn compose(pack: &Pack, kind: StageKind, file: &str) -> Composed {
+     } else {
+         entries
+     };
+-    let entries = if kind == StageKind::Material
+-        && pack.manifest.api == crate::manifest::AURORA_FOREST_API
++    let entries = if kind == StageKind::Material && crate::manifest::has_forest(&pack.manifest.api)
+     {
+         entries.replace("    @location(8) lighting: vec4<f32>,", "    @location(8) lighting: vec4<f32>,\n    @location(9) @interpolate(flat) is_leaves: u32,")
+             .replace("in.lighting);", "in.lighting, in.is_leaves != 0u);")
+     } else {
+         entries
+     };
++    let entries =
++        if kind == StageKind::Material && pack.manifest.api == crate::manifest::AURORA_HDR_API {
++            entries.replace(
++                "vec4(frame.fog_color, 0.0)",
++                "vec4(horizon_srgb_to_linear(frame.fog_color), 0.0)",
++            )
++        } else {
++            entries
++        };
++    let entries =
++        if kind == StageKind::Entity && pack.manifest.api == crate::manifest::AURORA_HDR_API {
++            entries
++                .replace(
++                    "    return entity(EntityInput",
++                    "    let colour = entity(EntityInput",
++                )
++                .replace(
++                    "in.light, in.hand != 0u));",
++                    "in.light, in.hand != 0u));\n    return vec4(display(colour.rgb), colour.a);",
++                )
++        } else {
++            entries
++        };
+     push("<entries>", &entries);
+     composed
+ }
+diff --git a/crates/horizon-shader-api/tests/scene_hdr.rs b/crates/horizon-shader-api/tests/scene_hdr.rs
+new file mode 100644
+index 0000000..f362d41
+--- /dev/null
++++ b/crates/horizon-shader-api/tests/scene_hdr.rs
+@@ -0,0 +1,57 @@
++use horizon_shader_api::{MANIFEST, Pack, StageKind, check};
++
++fn pack(api: &str, display: &str) -> Pack {
++    let manifest = format!(
++        "schema=1\nid=\"hdr_probe\"\nname=\"HDR\"\nversion=\"1\"\napi=\"{api}\"\n[sun_shadows]\nquality=\"low\"\n[sky]\nfile=\"s.wgsl\"\n[material]\nfile=\"m.wgsl\"\n[entity]\nfile=\"e.wgsl\"\n[[post]]\nfile=\"p.wgsl\"\n"
++    );
++    let entity =
++        format!("{display}\nfn entity(i:EntityInput)->vec4<f32>{{return vec4(4.0,2.0,1.0,1.0);}}");
++    Pack::from_files([
++        (MANIFEST, manifest.as_str()),
++        ("s.wgsl", "fn sky(i:SkyInput)->vec4<f32>{return i.color;}"),
++        ("m.wgsl", "fn material(i:MaterialInput)->Surface{return Surface(vec4(4.0,2.0,1.0,1.0),false);}"),
++        ("e.wgsl", entity.as_str()),
++        ("p.wgsl", "fn post(i:PostInput)->vec4<f32>{return i.color*0.25;}")
++    ].map(|(n,s)|(n.into(),s.as_bytes().to_vec())).into()).unwrap()
++}
++
++#[test]
++fn hdr_is_explicit_inherits_forest_and_requires_hand_display() {
++    let body = "fn display(c:vec3<f32>)->vec3<f32>{return horizon_linear_to_srgb(c*0.25);}";
++    let report = check(&pack("0.1-aurora-hdr.1", body)).unwrap();
++    assert!(report.scene_hdr);
++    assert!(
++        report
++            .stages
++            .iter()
++            .all(|s| s.scene_hdr && s.forest && s.clean_lighting)
++    );
++    assert!(check(&pack("0.1-aurora-hdr.1", "")).is_err());
++    let old = check(&pack("0.1-aurora-forest.1", "")).unwrap();
++    assert!(!old.scene_hdr);
++    assert!(old.stages.iter().all(|s| !s.scene_hdr));
++    for stage in [
++        StageKind::Sky,
++        StageKind::Material,
++        StageKind::Entity,
++        StageKind::Post,
++    ] {
++        assert!(
++            !stage
++                .prelude_for("0.1-aurora-forest.1")
++                .contains("fn horizon_linear_to_srgb")
++        );
++    }
++}
++
++#[test]
++fn hdr_rejects_missing_linear_world_stages() {
++    let manifest = "schema=1\nid=\"hdr_probe\"\nname=\"HDR\"\nversion=\"1\"\napi=\"0.1-aurora-hdr.1\"\n[[post]]\nfile=\"p.wgsl\"\n";
++    let files = [
++        (MANIFEST, manifest),
++        ("p.wgsl", "fn post(i:PostInput)->vec4<f32>{return i.color;}"),
++    ]
++    .map(|(n, s)| (n.into(), s.as_bytes().to_vec()))
++    .into();
++    assert!(Pack::from_files(files).is_err());
++}
+diff --git a/docs/aurora-hdr-api.md b/docs/aurora-hdr-api.md
+new file mode 100644
+index 0000000..d45b687
+--- /dev/null
++++ b/docs/aurora-hdr-api.md
+@@ -0,0 +1,51 @@
++# Local Aurora HDR API (`0.1-aurora-hdr.1`)
++
++Experimental extension of forest.1. Requires all four stages: sky, material,
++entity and at least one post. Requires renderer startup with `AURORA_HDR_PIPELINES=1`.
++Without the matching pipeline set, loading fails and keeps the last good pack.
++This is a local fork contract, not an upstream public API or HDR-display mode.
++
++## Colour contract
++
++- Sky, material and world entity outputs: scene-linear radiance, nonnegative RGB;
++  values above 1 are supported. Alpha retains its previous meaning.
++- Frame palette colours, `SkyInput.color`, albedo/tint, lightmap and
++  `EntityInput.vanilla`: authored display sRGB as before. Explicitly convert when
++  using them as radiance with `horizon_srgb_to_linear`.
++- `MaterialInput.fog.rgb`: linear. Its alpha remains the engine fog factor.
++  Engine-owned terrain/entity fog converts the palette before mixing.
++- Pre-translucent colour, world input, intermediate post/history RGB: linear FP16.
++- Final post output: display sRGB for the existing non-sRGB SDR view. The pack
++  owns exposure and tone mapping. No implicit exposure or automatic adaptation.
++- Mandatory entity `display(vec3<f32>) -> vec3<f32>` maps radiance to display
++  sRGB. Engine calls it once for the first-person hand, after glint and fog.
++  Share the same function with final post to keep their exposure consistent.
++
++GUI rendering and screen capture output stay SDR. Hand rendering follows world
++post and therefore does not receive world bloom. Legacy pack APIs keep their
++old pipeline formats and colour contracts.
++
++## Renderer
++
++World target and pre-translucent snapshot use Rgba16Float. Switching API or
++resizing rebuilds targets; new packs own their own post/history resources.
++Legacy world fragments have separate FP16 variants: Naga moves the fragment
++body into a helper and wraps its output in sRGB decoding. Early returns,
++discard and alpha are preserved. Screen/UI pipelines remain unchanged.
++
++GPU occlusion culling is disabled for HDR in this prototype because its render
++pipeline still has an SDR target. Frustum selection remains active. Compare
++performance with the baseline's occlusion culling disabled as well. Native
++TAA remains disabled under shader packs as before; cloud temporal history is
++pack-owned and remains FP16.
++
++## Validation
++
++`tests/scene_hdr.rs` checks opt-in inheritance, required stages/display and
++legacy isolation. `native_hdr::tests` validates transformed engine fragment
++interfaces. `native_scene::hdr_gpu_tests` reads back HDR alpha blending through
++the actual world target, pre-translucent snapshot and two post passes, then
++switches SDR/HDR and resizes. Entity GPU contract includes HDR hand display.
++Set `AURORA_REQUIRE_GPU=1` to make missing adapters fail these GPU tests.
++The developer archive harness compiles the complete pack and its model/hand
++pipelines; an actual game run must also validate all world fallback pipelines.

@@ -1,0 +1,623 @@
+From 7679364d954dd069b7dcfdc9a5a2f799d5f75fbe Mon Sep 17 00:00:00 2001
+From: "Laze ." <laze.@MacBook-Pro-50.local>
+Date: Fri, 30 Oct 2026 13:31:16 -0400
+Subject: [PATCH] Expose continuous immersion for opt-in Aurora underwater post
+
+Keep native fluid simulation and old shader ABI. Let water.3 compose water fog, remove the binary water overlay, and blend camera FOV over a continuous fluid volume.
+
+Co-Authored-By: Codex <noreply@openai.com>
+---
+ crates/horizon-client-render/src/fog.rs       | 74 +++++++++++++++++++
+ crates/horizon-client-render/src/gfx.rs       |  6 ++
+ .../src/gfx/native_pack.rs                    |  3 +
+ .../src/gfx/native_post.rs                    |  9 ++-
+ .../src/gfx/pack_uniforms.rs                  |  2 +
+ crates/horizon-client/src/game.rs             | 10 +--
+ crates/horizon-client/src/game/fov.rs         | 27 +++++--
+ crates/horizon-client/src/game/render_tick.rs | 35 ++++++++-
+ .../horizon-client/src/game/shader_packs.rs   |  7 ++
+ crates/horizon-shader-api/src/check.rs        |  8 +-
+ crates/horizon-shader-api/src/manifest.rs     | 18 ++++-
+ crates/horizon-shader-api/src/stages.rs       | 20 +++--
+ crates/horizon-shader-api/tests/check.rs      | 26 +++++++
+ crates/horizon-shader-api/tests/reference.rs  | 26 +++++++
+ crates/horizon-shader-api/tests/schema.rs     | 13 +++-
+ docs/api/aurora-water.md                      | 32 ++++++++
+ 16 files changed, 285 insertions(+), 31 deletions(-)
+
+diff --git a/crates/horizon-client-render/src/fog.rs b/crates/horizon-client-render/src/fog.rs
+index e8ef510..98b56d2 100644
+--- a/crates/horizon-client-render/src/fog.rs
++++ b/crates/horizon-client-render/src/fog.rs
+@@ -135,6 +135,36 @@ fn camera_fluid_height(world: &World, facts: &BlockFacts, b: [i32; 3]) -> Option
+     };
+     Some((s.fluid, height))
+ }
++/// Visual-only Aurora coverage, independent of simulation and breathing. A small
++/// camera volume is intersected with fluid cells; adjacent cells tile without seams.
++pub fn water_immersion(world: &World, facts: &BlockFacts, camera: [f64; 3]) -> f32 {
++    water_coverage(camera, |b| match camera_fluid_height(world, facts, b) {
++        Some((Fluid::Water, h)) => Some(h),
++        _ => None,
++    })
++}
++
++fn water_coverage(camera: [f64; 3], height: impl Fn([i32; 3]) -> Option<f64>) -> f32 {
++    const HALF: f64 = 0.18;
++    let lo = camera.map(|v| v - HALF);
++    let hi = camera.map(|v| v + HALF);
++    let mut volume = 0.0;
++    for y in lo[1].floor() as i32..=hi[1].floor() as i32 {
++        for z in lo[2].floor() as i32..=hi[2].floor() as i32 {
++            for x in lo[0].floor() as i32..=hi[0].floor() as i32 {
++                let Some(h) = height([x, y, z]) else { continue };
++                let b = [x as f64, y as f64, z as f64];
++                let upper = [b[0] + 1.0, b[1] + h.clamp(0.0, 1.0), b[2] + 1.0];
++                volume += (0..3)
++                    .map(|i| (hi[i].min(upper[i]) - lo[i].max(b[i])).max(0.0))
++                    .product::<f64>();
++            }
++        }
++    }
++    let t = (volume / (2.0 * HALF).powi(3)).clamp(0.0, 1.0) as f32;
++    t * t * (3.0 - 2.0 * t)
++}
++
+ /// `Camera.getFluidInCamera` (near-plane points reduced to the camera and
+ /// the point just in front of it).
+ pub fn fog_type(world: &World, facts: &BlockFacts, camera: [f64; 3], forward: [f64; 3]) -> FogType {
+@@ -418,6 +448,50 @@ fn rgb(c: u32) -> [f32; 3] {
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    #[test]
++    fn immersion_crosses_surface_continuously_without_internal_cell_seams() {
++        let lake = |b: [i32; 3]| {
++            if b[1] < 0 {
++                Some(1.0)
++            } else if b[1] == 0 {
++                Some(8.0 / 9.0)
++            } else {
++                None
++            }
++        };
++        let surface = 8.0 / 9.0;
++        assert!(water_coverage([0.0, surface + 0.181, 0.0], lake) < 1e-6);
++        assert!((water_coverage([0.0, surface, 0.0], lake) - 0.5).abs() < 1e-5);
++        assert!(water_coverage([0.0, surface - 0.181, 0.0], lake) > 0.99999);
++        let mut previous = 0.0;
++        for n in 0..=100 {
++            let coverage = water_coverage([-2.0, surface + 0.18 - n as f64 * 0.0036, -1.0], lake);
++            assert!(coverage >= previous && coverage - previous < 0.016);
++            previous = coverage;
++        }
++        for x in [
++            -1.00001, -1.0, -0.99999, -0.00001, 0.0, 0.00001, 0.99999, 1.0,
++        ] {
++            for y in [-1.00001, -1.0, -0.99999, 0.0, 0.5] {
++                assert!(
++                    water_coverage([x, y, x], lake) > 0.99999,
++                    "seam at {x}, {y}"
++                );
++            }
++        }
++    }
++
++    #[test]
++    fn immersion_respects_thin_fluid_sides_empty_space_and_coordinates() {
++        let thin = |b: [i32; 3]| (b == [-1, 5, 0]).then_some(2.0 / 9.0);
++        assert_eq!(water_coverage([-0.5, 6.0, 0.5], thin), 0.0);
++        assert!(water_coverage([-0.5, 5.1, 0.5], thin) > 0.6);
++        assert!(water_coverage([-0.5, 5.1, 0.5], thin) < 1.0);
++        assert_eq!(water_coverage([0.2, 5.1, 0.5], thin), 0.0);
++        assert!(water_coverage([0.0, 5.1, 0.5], thin) > 0.0);
++        assert_eq!(water_coverage([0.0; 3], |_| None), 0.0);
++    }
++
+     fn inputs(sky: &Sky) -> FogInputs<'_> {
+         FogInputs {
+             fog_type: FogType::Atmospheric,
+diff --git a/crates/horizon-client-render/src/gfx.rs b/crates/horizon-client-render/src/gfx.rs
+index 5338a9b..8dc00f2 100644
+--- a/crates/horizon-client-render/src/gfx.rs
++++ b/crates/horizon-client-render/src/gfx.rs
+@@ -3464,6 +3464,12 @@ impl Renderer {
+         }
+         report
+     }
++    /// The running, successfully compiled pack owns water fog and immersion.
++    pub fn aurora_water_environment(&self) -> bool {
++        self.native
++            .as_ref()
++            .is_some_and(|n| n.water_environment && n.post.is_some())
++    }
+     /// Drops the running shader pack, of either kind.
+     pub fn drop_shader_packs(&mut self) {
+         self.pack_post = None;
+diff --git a/crates/horizon-client-render/src/gfx/native_pack.rs b/crates/horizon-client-render/src/gfx/native_pack.rs
+index 4fb5cdc..ad563b9 100644
+--- a/crates/horizon-client-render/src/gfx/native_pack.rs
++++ b/crates/horizon-client-render/src/gfx/native_pack.rs
+@@ -9,6 +9,7 @@ use super::native_sky::NativeSky;
+ use super::pack_timing::PassTiming;
+ 
+ pub struct NativePack {
++    pub water_environment: bool,
+     pub frame: NativeFrame,
+     pub sky: Option<NativeSky>,
+     pub material: Option<NativeMaterial>,
+@@ -30,6 +31,7 @@ impl NativePack {
+     ) -> Result<(Self, Vec<String>), String> {
+         let (globals, format) = (terrain.globals, terrain.format);
+         let frame = NativeFrame::new(device);
++        let water_environment = report.water_environment;
+         let (post, others): (Vec<_>, Vec<_>) = report
+             .stages
+             .into_iter()
+@@ -58,6 +60,7 @@ impl NativePack {
+             labels.extend(post.labels().into_iter().map(str::to_owned));
+         }
+         let pack = Self {
++            water_environment,
+             frame,
+             sky,
+             material,
+diff --git a/crates/horizon-client-render/src/gfx/native_post.rs b/crates/horizon-client-render/src/gfx/native_post.rs
+index f5203c8..8866da9 100644
+--- a/crates/horizon-client-render/src/gfx/native_post.rs
++++ b/crates/horizon-client-render/src/gfx/native_post.rs
+@@ -48,7 +48,7 @@ pub(super) fn frame_entry(visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayo
+         ty: wgpu::BindingType::Buffer {
+             ty: wgpu::BufferBindingType::Uniform,
+             has_dynamic_offset: false,
+-            min_binding_size: wgpu::BufferSize::new(size_of::<FrameInputs>() as u64),
++            min_binding_size: wgpu::BufferSize::new((size_of::<FrameInputs>() + 16) as u64),
+         },
+         count: None,
+     }
+@@ -58,7 +58,7 @@ impl NativeFrame {
+     pub fn new(device: &wgpu::Device) -> Self {
+         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+             label: Some("Native shader pack frame"),
+-            size: size_of::<FrameInputs>() as u64,
++            size: (size_of::<FrameInputs>() + 16) as u64,
+             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+             mapped_at_creation: false,
+         });
+@@ -101,6 +101,11 @@ impl NativeFrame {
+         }
+         self.frames = self.frames.wrapping_add(1);
+         queue.write_buffer(&self.buffer, 0, bytemuck::bytes_of(&inputs));
++        queue.write_buffer(
++            &self.buffer,
++            size_of::<FrameInputs>() as u64,
++            bytemuck::cast_slice(&frame.pack.aurora_water),
++        );
+     }
+ }
+ 
+diff --git a/crates/horizon-client-render/src/gfx/pack_uniforms.rs b/crates/horizon-client-render/src/gfx/pack_uniforms.rs
+index 4da492b..fb81008 100644
+--- a/crates/horizon-client-render/src/gfx/pack_uniforms.rs
++++ b/crates/horizon-client-render/src/gfx/pack_uniforms.rs
+@@ -11,6 +11,8 @@ use super::Frame;
+ /// What the game passes for the pack's uniforms, beyond what `Frame` carries.
+ #[derive(Clone, Copy, Debug, Default)]
+ pub struct PackInputs {
++    /// Aurora water.3: continuous camera coverage, enabled flag, two reserved zeros.
++    pub aurora_water: [f32; 4],
+     /// `Level.getDayTime`.
+     pub day_time: i64,
+     /// The interpolated rain and thunder levels, 0..1.
+diff --git a/crates/horizon-client/src/game.rs b/crates/horizon-client/src/game.rs
+index c2b7b4a..2abcc06 100644
+--- a/crates/horizon-client/src/game.rs
++++ b/crates/horizon-client/src/game.rs
+@@ -12376,6 +12376,11 @@ impl Game<'_> {
+         } else {
+             (view_yaw, view_pitch)
+         };
++        let pack_inputs = if title {
++            Default::default()
++        } else {
++            self.shader_pack_inputs(camera, alpha as f32)
++        };
+         let fov_degrees = if title {
+             85.0
+         } else {
+@@ -12470,11 +12475,6 @@ impl Game<'_> {
+         } else {
+             self.gather_dynamic_lights(camera, alpha);
+         }
+-        let pack_inputs = if title {
+-            Default::default()
+-        } else {
+-            self.shader_pack_inputs(camera, alpha as f32)
+-        };
+         // Map textures and font glyphs changed while building this frame's
+         // geometry (game/maps.rs, world text) upload with this batch; draining
+         // map_patches any earlier leaves them a frame behind.
+diff --git a/crates/horizon-client/src/game/fov.rs b/crates/horizon-client/src/game/fov.rs
+index 40ee2f0..8bf8e73 100644
+--- a/crates/horizon-client/src/game/fov.rs
++++ b/crates/horizon-client/src/game/fov.rs
+@@ -108,24 +108,35 @@ impl Game<'_> {
+     }
+     /// `Camera.calculateFov` with `modifyFovBasedOnDeathOrFluid`.
+     pub(super) fn fov_degrees(&self, partial: f32, camera: [f64; 3]) -> f32 {
++        let immersion = self.aurora_immersion(camera);
++        let fluid = if immersion.is_some() {
++            CameraFluid::None
++        } else {
++            self.camera_fluid(camera)
++        };
+         let fov = self.view.calculate_fov(
+             partial,
+             self.settings.fov as i32,
+             self.fov_effect_scale(),
+             self.death_time(),
+-            self.camera_fluid(camera),
++            fluid,
+             false,
+         );
+-        self.zoomed_fov_degrees(fov)
++        self.zoomed_fov_degrees(
++            fov * (1.0 - immersion.unwrap_or(0.0) * self.fov_effect_scale() * (1.0 - 0.857_142_87)),
++        )
+     }
+     /// `Camera.calculateHudFov`: the first-person hand's field of view.
+     pub(super) fn hud_fov_degrees(&self, partial: f32, camera: [f64; 3]) -> f32 {
+-        self.view.calculate_hud_fov(
+-            partial,
+-            self.fov_effect_scale(),
+-            self.death_time(),
+-            self.camera_fluid(camera),
+-        )
++        let immersion = self.aurora_immersion(camera);
++        let fluid = if immersion.is_some() {
++            CameraFluid::None
++        } else {
++            self.camera_fluid(camera)
++        };
++        self.view
++            .calculate_hud_fov(partial, self.fov_effect_scale(), self.death_time(), fluid)
++            * (1.0 - immersion.unwrap_or(0.0) * self.fov_effect_scale() * (1.0 - 0.857_142_87))
+     }
+     /// The pose `GameRenderer.renderLevel` multiplies into the projection:
+     /// `bobHurt`, then `bobView` with the View Bobbing option.
+diff --git a/crates/horizon-client/src/game/render_tick.rs b/crates/horizon-client/src/game/render_tick.rs
+index 3003867..2132e87 100644
+--- a/crates/horizon-client/src/game/render_tick.rs
++++ b/crates/horizon-client/src/game/render_tick.rs
+@@ -86,6 +86,30 @@ impl Game<'_> {
+             yaw.cos() * pitch.cos(),
+         ]
+     }
++    /// None retains the native environment for other packs, dimensions and statuses.
++    pub(super) fn aurora_immersion(&self, camera: [f64; 3]) -> Option<f32> {
++        if self.title.is_some()
++            || self.dim != Dim::Overworld
++            || !self
++                .renderer
++                .as_ref()
++                .is_some_and(|r| r.aurora_water_environment())
++            || ["blindness", "darkness", "night_vision"]
++                .iter()
++                .any(|e| self.potions.effects.get(e).is_some())
++            || matches!(
++                fog_type(&self.world, self.res.facts(), camera, self.forward()),
++                FogType::Lava | FogType::PowderSnow
++            )
++        {
++            return None;
++        }
++        Some(horizon_client::fog::water_immersion(
++            &self.world,
++            self.res.facts(),
++            camera,
++        ))
++    }
+     /// `FogRenderer.setupFog` for the frame's camera, and Horizon's Fog option.
+     pub(super) fn frame_fog(
+         &self,
+@@ -96,7 +120,12 @@ impl Game<'_> {
+     ) -> FogData {
+         let forward = self.forward();
+         let at = [camera.x, camera.y, camera.z];
+-        let fog_type = fog_type(&self.world, self.res.facts(), at, forward);
++        let mut fog_type = fog_type(&self.world, self.res.facts(), at, forward);
++        if self.aurora_immersion(at).is_some() {
++            // The required post stage composes water attenuation from scene depth.
++            // Retain native air/distance fog, rather than baking blue water fog twice.
++            fog_type = FogType::Atmospheric;
++        }
+         let (rain, thunder) = if self.dim == Dim::Overworld {
+             self.world.weather.levels(self.clock.fraction() as f32)
+         } else {
+@@ -229,8 +258,8 @@ impl Game<'_> {
+         }
+         let in_water =
+             fog_type(&self.world, self.res.facts(), eye, self.forward()) == FogType::Water;
+-        let water =
+-            (in_water && !spectator).then(|| (self.eye_brightness(eye), self.yaw, self.pitch));
++        let water = (in_water && !spectator && self.aurora_immersion(eye).is_none())
++            .then(|| (self.eye_brightness(eye), self.yaw, self.pitch));
+         // Hud.extractCameraOverlays; the spyglass scope (and its easing) is
+         // drawn on the HUD by draw_spyglass.
+         let fx = &self.screen_fx;
+diff --git a/crates/horizon-client/src/game/shader_packs.rs b/crates/horizon-client/src/game/shader_packs.rs
+index 26b4d1b..732f8b4 100644
+--- a/crates/horizon-client/src/game/shader_packs.rs
++++ b/crates/horizon-client/src/game/shader_packs.rs
+@@ -158,7 +158,14 @@ impl Game<'_> {
+             .map(|c| c.biome(at.x, at.y, at.z));
+         let (held_items, held_light) = self.held_for_pack();
+         let info = biome.map(|b| self.res.biomes().get(b));
++        let immersion = self.aurora_immersion(camera.to_array());
+         PackInputs {
++            aurora_water: [
++                immersion.unwrap_or(0.0),
++                if immersion.is_some() { 1.0 } else { 0.0 },
++                0.0,
++                0.0,
++            ],
+             day_time: self.world.day_time,
+             rain: lerp(self.world.weather.rain_level),
+             thunder: lerp(self.world.weather.thunder_level),
+diff --git a/crates/horizon-shader-api/src/check.rs b/crates/horizon-shader-api/src/check.rs
+index 54781a4..38c2252 100644
+--- a/crates/horizon-shader-api/src/check.rs
++++ b/crates/horizon-shader-api/src/check.rs
+@@ -72,6 +72,7 @@ pub struct CheckedStage {
+ 
+ #[derive(Debug)]
+ pub struct Report {
++    pub water_environment: bool,
+     pub stages: Vec<CheckedStage>,
+ }
+ 
+@@ -117,7 +118,10 @@ pub fn check(pack: &Pack) -> Result<Report, Vec<Problem>> {
+         }
+     }
+     if problems.is_empty() {
+-        Ok(Report { stages: checked })
++        Ok(Report {
++            stages: checked,
++            water_environment: m.api == crate::manifest::AURORA_IMMERSION_API,
++        })
+     } else {
+         Err(problems)
+     }
+@@ -172,7 +176,7 @@ pub fn check_stage(pack: &Pack, kind: StageKind, file: &str) -> Result<CheckedSt
+     Ok(CheckedStage {
+         kind,
+         scene_snapshot: kind == StageKind::Material
+-            && pack.manifest.api == crate::manifest::AURORA_SCENE_API,
++            && crate::manifest::has_scene_snapshot(&pack.manifest.api),
+         file: file.to_owned(),
+         label: file.to_owned(),
+         module,
+diff --git a/crates/horizon-shader-api/src/manifest.rs b/crates/horizon-shader-api/src/manifest.rs
+index 63e99a5..bef52dd 100644
+--- a/crates/horizon-shader-api/src/manifest.rs
++++ b/crates/horizon-shader-api/src/manifest.rs
+@@ -12,6 +12,11 @@ pub const API: &str = "0.1";
+ pub const AURORA_WATER_API: &str = "0.1-aurora-water.1";
+ /// Opt-in pre-translucent scene snapshot and composited material output.
+ pub const AURORA_SCENE_API: &str = "0.1-aurora-water.2";
++/// Continuous water immersion; the pack owns water fog in a required post stage.
++pub const AURORA_IMMERSION_API: &str = "0.1-aurora-water.3";
++pub fn has_scene_snapshot(api: &str) -> bool {
++    matches!(api, AURORA_SCENE_API | AURORA_IMMERSION_API)
++}
+ /// Full-screen passes a pack may chain.
+ pub const MAX_POST_PASSES: usize = 8;
+ /// Options a pack may declare.
+@@ -143,9 +148,13 @@ impl Manifest {
+                 raw.schema
+             )));
+         }
+-        if raw.api != API && raw.api != AURORA_WATER_API && raw.api != AURORA_SCENE_API {
++        if raw.api != API
++            && raw.api != AURORA_WATER_API
++            && raw.api != AURORA_SCENE_API
++            && raw.api != AURORA_IMMERSION_API
++        {
+             return Err(err(format!(
+-                "written for shader API {}; this Horizon serves {API}, {AURORA_WATER_API} and {AURORA_SCENE_API}",
++                "written for shader API {}; this Horizon serves {API}, {AURORA_WATER_API}, {AURORA_SCENE_API} and {AURORA_IMMERSION_API}",
+                 raw.api
+             )));
+         }
+@@ -165,6 +174,11 @@ impl Manifest {
+                 "no stage: give it a [sky], a [material] or a [[post]]".into()
+             ));
+         }
++        if raw.api == AURORA_IMMERSION_API && raw.post.is_empty() {
++            return Err(err(
++                "water.3 requires a post stage to compose underwater fog".into(),
++            ));
++        }
+         if raw.post.len() > MAX_POST_PASSES {
+             return Err(err(format!(
+                 "{} post passes; a pack may chain {MAX_POST_PASSES}",
+diff --git a/crates/horizon-shader-api/src/stages.rs b/crates/horizon-shader-api/src/stages.rs
+index b213f93..33f893c 100644
+--- a/crates/horizon-shader-api/src/stages.rs
++++ b/crates/horizon-shader-api/src/stages.rs
+@@ -222,7 +222,12 @@ impl StageKind {
+     /// water.2 changes only the material stage. Existing API lines retain their ABI.
+     pub fn prelude_for(self, api: &str) -> String {
+         let mut out = self.prelude();
+-        if self == StageKind::Material && api == crate::manifest::AURORA_SCENE_API {
++        if api == crate::manifest::AURORA_IMMERSION_API {
++            let frame = Frame::WGSL.wgsl();
++            out = out.replace(&frame, &frame.replacen("}\n",
++                "    // x: continuous water coverage, y: water environment enabled; z/w reserved.\n    water: vec4<f32>,\n}\n", 1));
++        }
++        if self == StageKind::Material && crate::manifest::has_scene_snapshot(api) {
+             out = out.replace(&SURFACE.wgsl(),
+                 "// scene_composited skips engine fog; only for already composited scene colour.\nstruct Surface { color: vec4<f32>, scene_composited: bool, }\n");
+             out = out.replace(
+@@ -294,16 +299,15 @@ pub fn compose(pack: &Pack, kind: StageKind, file: &str) -> Composed {
+         push(shared, pack.source(shared).unwrap_or_default());
+     }
+     push(file, pack.source(file).unwrap_or_default());
+-    let entries = if kind == StageKind::Material
+-        && pack.manifest.api == crate::manifest::AURORA_SCENE_API
+-    {
+-        kind.entries().replace(
++    let entries =
++        if kind == StageKind::Material && crate::manifest::has_scene_snapshot(&pack.manifest.api) {
++            kind.entries().replace(
+             "in.is_water != 0u);",
+             "in.is_water != 0u, in.position.xy / frame.resolution, vec4(frame.fog_color, 0.0));",
+         )
+-    } else {
+-        kind.entries().to_owned()
+-    };
++        } else {
++            kind.entries().to_owned()
++        };
+     push("<entries>", &entries);
+     composed
+ }
+diff --git a/crates/horizon-shader-api/tests/check.rs b/crates/horizon-shader-api/tests/check.rs
+index 7ca372f..615a768 100644
+--- a/crates/horizon-shader-api/tests/check.rs
++++ b/crates/horizon-shader-api/tests/check.rs
+@@ -173,3 +173,29 @@ fn scene_material_inputs_are_opt_in_and_translate() {
+             .all(|s| !s.scene_snapshot)
+     );
+ }
++
++#[test]
++fn immersion_stages_translate_and_opt_in_only_on_water_three() {
++    for api in ["0.1-aurora-water.2", "0.1-aurora-water.3"] {
++        let manifest = format!(
++            "schema=1\nid=\"t\"\nname=\"Test\"\nversion=\"1\"\napi=\"{api}\"\n[material]\nfile=\"m.wgsl\"\n[[post]]\nfile=\"p.wgsl\"\n"
++        );
++        let material = "fn material(i: MaterialInput) -> Surface { return Surface(vec4(frame.water.x), false); }";
++        let post = "fn post(i: PostInput) -> vec4<f32> { return mix(i.color, vec4(0.0), frame.water.x * frame.water.y); }";
++        let files = [
++            (MANIFEST, manifest.as_str()),
++            ("m.wgsl", material),
++            ("p.wgsl", post),
++        ]
++        .map(|(k, v)| (k.into(), v.as_bytes().to_vec()))
++        .into();
++        let result = check(&Pack::from_files(files).unwrap());
++        if api.ends_with("water.3") {
++            let result = result.unwrap();
++            assert!(result.water_environment);
++            assert!(result.stages.iter().any(|s| s.scene_snapshot));
++        } else {
++            assert!(result.is_err());
++        }
++    }
++}
+diff --git a/crates/horizon-shader-api/tests/reference.rs b/crates/horizon-shader-api/tests/reference.rs
+index fc54859..729e3d7 100644
+--- a/crates/horizon-shader-api/tests/reference.rs
++++ b/crates/horizon-shader-api/tests/reference.rs
+@@ -117,3 +117,29 @@ fn the_reference_is_up_to_date() {
+         "{DOC} is out of date: HORIZON_WRITE_DOCS=1 cargo test -p horizon-shader-api --test reference"
+     );
+ }
++
++#[test]
++fn immersion_frame_appends_one_aligned_vector_without_changing_legacy_fields() {
++    for kind in StageKind::ALL {
++        let prelude = kind.prelude_for("0.1-aurora-water.3");
++        let module = validate(&prelude);
++        let (_, ty) = module
++            .types
++            .iter()
++            .find(|(_, t)| t.name.as_deref() == Some("Frame"))
++            .unwrap();
++        let naga::TypeInner::Struct { members, span } = &ty.inner else {
++            panic!("Frame struct")
++        };
++        assert_eq!(*span as usize, size_of::<Frame>() + 16);
++        let water = members.last().unwrap();
++        assert_eq!(water.name.as_deref(), Some("water"));
++        assert_eq!(water.offset as usize, size_of::<Frame>());
++        for (member, offset) in members.iter().zip(Frame::OFFSETS) {
++            assert_eq!(member.offset as usize, *offset);
++        }
++        for api in ["0.1", "0.1-aurora-water.1", "0.1-aurora-water.2"] {
++            assert!(!kind.prelude_for(api).contains("water: vec4<f32>"));
++        }
++    }
++}
+diff --git a/crates/horizon-shader-api/tests/schema.rs b/crates/horizon-shader-api/tests/schema.rs
+index 78f4bab..8c4d9c3 100644
+--- a/crates/horizon-shader-api/tests/schema.rs
++++ b/crates/horizon-shader-api/tests/schema.rs
+@@ -18,7 +18,7 @@ fn local_water_api_is_explicit_and_unknown_extensions_are_rejected() {
+     let local = sample_text().replace("api = \"0.1\"", "api = \"0.1-aurora-water.1\"");
+     assert_eq!(Manifest::parse(&local).unwrap().api, "0.1-aurora-water.1");
+     assert!(Manifest::parse(&local.replace("water.1", "water.2")).is_ok());
+-    assert!(Manifest::parse(&local.replace("water.1", "water.3")).is_err());
++    assert!(Manifest::parse(&local.replace("water.1", "water.4")).is_err());
+ }
+ 
+ fn refused(text: &str) -> String {
+@@ -244,3 +244,14 @@ fn refuses_files_a_pack_does_not_use() {
+             .contains("missing at the pack's root")
+     );
+ }
++
++#[test]
++fn immersion_api_requires_a_post_stage() {
++    let text = "schema=1\nid=\"t\"\nname=\"T\"\nversion=\"1\"\napi=\"0.1-aurora-water.3\"\n[sky]\nfile=\"s.wgsl\"\n";
++    assert!(
++        Manifest::parse(text)
++            .unwrap_err()
++            .contains("requires a post stage")
++    );
++    assert!(Manifest::parse(&format!("{text}\n[[post]]\nfile=\"p.wgsl\"\n")).is_ok());
++}
+diff --git a/docs/api/aurora-water.md b/docs/api/aurora-water.md
+index fd951b8..6fb30e2 100644
+--- a/docs/api/aurora-water.md
++++ b/docs/api/aurora-water.md
+@@ -56,3 +56,35 @@ resize. It reports an explicit skip when no GPU is available; that is not GPU
+ validation. Test the actual game with both sky/material stages (their group 3
+ layouts differ), material-only/TAA, hot reload, resize and a previous API pack.
+ Use disposable homes/worlds as required by AGENTS.md.
++
++## water.3: continuous immersion and a pack-owned water environment
++
++`0.1-aurora-water.3` inherits the scene snapshot contract. Every stage appends
++one aligned vector to Frame: `water: vec4<f32>`. `water.x` is continuous camera
++water coverage in 0..1; `water.y` is 1 when the custom environment is enabled,
++otherwise 0; z/w are reserved zeros. Legacy Frame field offsets and its WGSL
++size stay unchanged for older API lines. The renderer allocates 16 trailing
++bytes, with a layout test checking the extended prefix and offset.
++
++The game measures the fraction of a 0.36-block cube around the interpolated
++camera occupied by water cells, then applies smoothstep. It uses the existing
++camera fluid-height rule, including flowing/waterlogged fluid. Adjacent cells
++sum without artificial seams. This is a visual coverage approximation, not
++physical eye submersion or a resolved near-plane waterline. It has no temporal
++history: teleports do not retain the previous water state.
++
++The API requires at least one post stage. Only a successfully compiled/running
++water.3 pack enables the replacement. In the Overworld, without blindness,
++darkness, night vision, lava or powder snow, native atmospheric/distance fog is
++retained and native water fog is not baked into the scene. The pack MUST compose
++its water attenuation in post using the depth and continuous coverage. The
++stock binary water screen overlay is disabled; world/hand FOV fluid scaling is
++interpolated using the same coverage and the user's FOV Effects scale. Physical
++fluid detection, player swimming, breathing, audio and ticks are unchanged.
++
++Switching to a previous API or no pack restores native fog/FOV/overlay. Other
++dimensions and the listed statuses retain the native environment (`water.y=0`),
++so the pack must return its unmodified post input there. This API does not expose
++per-pixel water exit depth; a screen-space water pass still approximates mixed
++water/air paths and transparent layers. The first-person hand and HUD are drawn
++after the world's post chain and are not colour-graded by this water pass.
+-- 
+2.50.1 (Apple Git-155)
+

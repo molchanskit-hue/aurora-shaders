@@ -1,0 +1,766 @@
+From 54bafa69714bed321361746c9ad819ac704f15d2 Mon Sep 17 00:00:00 2001
+From: "Laze ." <laze.@MacBook-Pro-50.local>
+Date: Fri, 30 Oct 2026 15:13:01 -0400
+Subject: [PATCH] Add opt-in shadow quality recipes with real Low disable
+
+Co-authored-by: Codex <noreply@openai.com>
+---
+ crates/horizon-client-render/src/gfx.rs       |   5 +-
+ .../src/gfx/native_material.rs                |  59 ++++++---
+ .../src/gfx/native_shadow.rs                  | 118 +++++++++++-------
+ .../src/gfx/native_shadow_tests.rs            |  42 ++++++-
+ crates/horizon-shader-api/src/check.rs        |   8 +-
+ crates/horizon-shader-api/src/manifest.rs     |  85 ++++++++++++-
+ crates/horizon-shader-api/src/stages.rs       |  29 ++++-
+ .../src/sun_shadow_quality.wgsl               |  31 +++++
+ crates/horizon-shader-api/tests/check.rs      |  25 ++++
+ crates/horizon-shader-api/tests/schema.rs     |  26 ++++
+ docs/api/aurora-sun-shadows.md                |  36 ++++++
+ 11 files changed, 386 insertions(+), 78 deletions(-)
+ create mode 100644 crates/horizon-shader-api/src/sun_shadow_quality.wgsl
+
+diff --git a/crates/horizon-client-render/src/gfx.rs b/crates/horizon-client-render/src/gfx.rs
+index 66c4a67..fdec3b9 100644
+--- a/crates/horizon-client-render/src/gfx.rs
++++ b/crates/horizon-client-render/src/gfx.rs
+@@ -3984,7 +3984,7 @@ impl Renderer {
+                     .as_ref()
+                     .and_then(|n| n.material.as_ref())
+                     .and_then(|m| m.shadow.as_ref())
+-                    .and_then(|_| native_shadow::view(frame))
++                    .and_then(|s| s.view(frame))
+             });
+         let mut shadow_visible = std::mem::take(&mut self.shadow_visible);
+         shadow_visible.clear();
+@@ -4775,6 +4775,7 @@ impl Renderer {
+                 .as_ref()
+                 .and_then(|n| n.material.as_ref())
+                 .and_then(|m| m.shadow.as_ref())
++                .filter(|s| s.enabled())
+         {
+             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                 label: Some("Aurora sunlight terrain"),
+@@ -4789,7 +4790,7 @@ impl Renderer {
+                 }),
+                 ..Default::default()
+             });
+-            if native_shadow::view(frame).is_some() {
++            if shadow.view(frame).is_some() {
+                 pass.set_pipeline(&shadow.pipeline);
+                 pass.set_bind_group(0, &self.group, &[]);
+                 pass.set_bind_group(2, &shadow.caster, &[]);
+diff --git a/crates/horizon-client-render/src/gfx/native_material.rs b/crates/horizon-client-render/src/gfx/native_material.rs
+index 7fe1bb3..97c1e7b 100644
+--- a/crates/horizon-client-render/src/gfx/native_material.rs
++++ b/crates/horizon-client-render/src/gfx/native_material.rs
+@@ -172,9 +172,13 @@ impl NativeMaterial {
+         ];
+         constants.extend(sprite_names.into_iter().zip(shape.sprites));
+         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+-        let shadow = stage
+-            .sun_shadow
+-            .then(|| super::native_shadow::NativeShadow::new(device, shape));
++        let shadow = stage.sun_shadow.then(|| {
++            super::native_shadow::NativeShadow::new(
++                device,
++                shape,
++                stage.sun_shadow_quality.unwrap_or_default(),
++            )
++        });
+         let scene = stage
+             .scene_snapshot
+             .then(|| NativeScene::new(device, shape.format));
+@@ -390,25 +394,44 @@ mod tests {
+ 
+     #[test]
+     fn sunlight_material_composes_with_real_terrain_entries() {
+-        let manifest = "schema=1\nid=\"t\"\nname=\"T\"\nversion=\"1\"\napi=\"0.1-aurora-shadow.1\"\n[material]\nfile=\"m.wgsl\"\n[[post]]\nfile=\"p.wgsl\"\n";
+-        let material = "fn material(i: MaterialInput) -> Surface {
++        for quality in [
++            None,
++            Some("low"),
++            Some("medium"),
++            Some("high"),
++            Some("ultra"),
++        ] {
++            let manifest = "schema=1\nid=\"t\"\nname=\"T\"\nversion=\"1\"\napi=\"0.1-aurora-shadow.1\"\n[material]\nfile=\"m.wgsl\"\n[[post]]\nfile=\"p.wgsl\"\n";
++            let manifest = match quality {
++                Some(q) => {
++                    manifest.replace("0.1-aurora-shadow.1", "0.1-aurora-shadow.2")
++                        + &format!("\n[sun_shadows]\nquality=\"{q}\"\n")
++                }
++                None => manifest.to_string(),
++            };
++            let material = "fn material(i: MaterialInput) -> Surface {
+             let n=normalize(cross(dpdx(i.position),dpdy(i.position)));
+             let c=textureSampleLevel(pre_translucent_color,scene_sampler,i.screen_uv,0.0);
+             return Surface(c * sun_visibility(i.position,n),i.translucent); }";
+-        let post = "fn post(i: PostInput) -> vec4<f32> { return i.color; }";
+-        let files = [(MANIFEST, manifest), ("m.wgsl", material), ("p.wgsl", post)]
++            let post = "fn post(i: PostInput) -> vec4<f32> { return i.color; }";
++            let files = [
++                (MANIFEST, manifest.as_str()),
++                ("m.wgsl", material),
++                ("p.wgsl", post),
++            ]
+             .map(|(k, v)| (k.into(), v.as_bytes().to_vec()))
+             .into();
+-        let stage = check(&Pack::from_files(files).unwrap())
+-            .unwrap()
+-            .stages
+-            .remove(0);
+-        let module = module(&stage).unwrap();
+-        naga::valid::Validator::new(
+-            naga::valid::ValidationFlags::all(),
+-            naga::valid::Capabilities::all(),
+-        )
+-        .validate(&module)
+-        .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&shader_source(&stage))));
++            let stage = check(&Pack::from_files(files).unwrap())
++                .unwrap()
++                .stages
++                .remove(0);
++            let module = module(&stage).unwrap();
++            naga::valid::Validator::new(
++                naga::valid::ValidationFlags::all(),
++                naga::valid::Capabilities::all(),
++            )
++            .validate(&module)
++            .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&shader_source(&stage))));
++        }
+     }
+ }
+diff --git a/crates/horizon-client-render/src/gfx/native_shadow.rs b/crates/horizon-client-render/src/gfx/native_shadow.rs
+index ed95989..4598d68 100644
+--- a/crates/horizon-client-render/src/gfx/native_shadow.rs
++++ b/crates/horizon-client-render/src/gfx/native_shadow.rs
+@@ -1,4 +1,4 @@
+-//! Aurora shadow.1: one texel-stabilized orthographic map for opaque/cutout terrain.
++//! Aurora shadow.1/2: one texel-stabilized orthographic map for opaque/cutout terrain.
+ //! Camera-independent caster visibility; no entities, translucent casters or LOD meshes.
+ use super::{
+     Frame,
+@@ -7,9 +7,7 @@ use super::{
+ };
+ use glam::{DMat4, DVec3, Mat4, Vec3};
+ 
+-pub(super) const SIZE: u32 = 2048;
+-const RADIUS: f32 = 48.0;
+-const CASTER_DISTANCE: f32 = 96.0;
++use horizon_shader_api::manifest::SunShadowQuality;
+ 
+ #[repr(C)]
+ #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+@@ -25,37 +23,48 @@ pub struct NativeShadow {
+     pub pipeline: wgpu::RenderPipeline,
+     pub depth: wgpu::TextureView,
+     uniform: wgpu::Buffer,
++    quality: SunShadowQuality,
+ }
+ 
+ // Only x/y snap: preserving continuous depth avoids depth jumps during translation.
+-fn matrix(camera: DVec3, light: Vec3) -> Mat4 {
++fn matrix(camera: DVec3, light: Vec3, quality: SunShadowQuality) -> Mat4 {
++    let radius = quality.radius();
+     let rotation = DMat4::look_to_rh(DVec3::ZERO, -light.as_dvec3(), DVec3::Z);
+     let at = rotation.transform_vector3(camera);
+-    let step = f64::from(2.0 * RADIUS / SIZE as f32);
++    let step = f64::from(2.0 * radius / quality.size() as f32);
+     let offset = DVec3::new(
+         at.x - (at.x / step).floor() * step,
+         at.y - (at.y / step).floor() * step,
+         -128.0,
+     );
+-    Mat4::orthographic_rh(-RADIUS, RADIUS, -RADIUS, RADIUS, 0.1, 256.0)
++    Mat4::orthographic_rh(-radius, radius, -radius, radius, 0.1, 256.0)
+         * (DMat4::from_translation(offset) * rotation).as_mat4()
+ }
+ 
+-pub(super) fn view(frame: &Frame) -> Option<ShadowView> {
+-    let a = frame.sky.sun_angle.to_radians();
+-    let light = Vec3::new(-a.sin(), a.cos(), 0.0);
+-    if frame.title || frame.nether_lighting || frame.end_sky || light.y <= 0.05 {
+-        return None;
++impl NativeShadow {
++    pub(super) fn enabled(&self) -> bool {
++        self.quality.enabled()
+     }
+-    Some(ShadowView {
+-        cull: matrix(frame.camera, light),
+-        light,
+-        distance: Some(CASTER_DISTANCE),
+-    })
+-}
+ 
+-impl NativeShadow {
+-    pub fn new(device: &wgpu::Device, shape: &TerrainShape<'_>) -> Self {
++    pub(super) fn view(&self, frame: &Frame) -> Option<ShadowView> {
++        let a = frame.sky.sun_angle.to_radians();
++        let light = Vec3::new(-a.sin(), a.cos(), 0.0);
++        if !self.enabled()
++            || frame.title
++            || frame.nether_lighting
++            || frame.end_sky
++            || light.y <= 0.05
++        {
++            return None;
++        }
++        Some(ShadowView {
++            cull: matrix(frame.camera, light, self.quality),
++            light,
++            distance: Some(self.quality.caster_distance()),
++        })
++    }
++
++    pub fn new(device: &wgpu::Device, shape: &TerrainShape<'_>, quality: SunShadowQuality) -> Self {
+         let uniform_entry = wgpu::BindGroupLayoutEntry {
+             binding: 2,
+             visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+@@ -93,8 +102,8 @@ impl NativeShadow {
+             .create_texture(&wgpu::TextureDescriptor {
+                 label: Some("Aurora sun depth"),
+                 size: wgpu::Extent3d {
+-                    width: SIZE,
+-                    height: SIZE,
++                    width: quality.size(),
++                    height: quality.size(),
+                     depth_or_array_layers: 1,
+                 },
+                 mip_level_count: 1,
+@@ -213,20 +222,21 @@ impl NativeShadow {
+             pipeline,
+             depth,
+             uniform,
++            quality,
+         }
+     }
+ 
+     pub(super) fn prepare(&self, queue: &wgpu::Queue, frame: &Frame) {
+-        let view = view(frame);
++        let view = self.view(frame);
+         let data = Uniform {
+             matrix: view
+                 .as_ref()
+                 .map_or(Mat4::IDENTITY, |v| v.cull)
+                 .to_cols_array_2d(),
+             parameters: [
+-                1.0 / SIZE as f32,
+-                32.0,
+-                44.0,
++                1.0 / self.quality.size() as f32,
++                self.quality.fade()[0],
++                self.quality.fade()[1],
+                 if view.is_some() { 1.0 } else { 0.0 },
+             ],
+         };
+@@ -239,25 +249,45 @@ mod tests {
+     use super::*;
+     #[test]
+     fn projection_depth_and_texel_stability() {
+-        let light = Vec3::new(-0.6, 0.8, 0.0);
+-        let camera = DVec3::new(100000.013, 64.021, -200000.027);
+-        let m = matrix(camera, light);
+-        let p = m.project_point3(Vec3::ZERO);
+-        let toward = m.project_point3(light * 10.0);
+-        assert!(p.z > 0.0 && p.z < 1.0);
+-        assert!(toward.z < p.z, "sunward caster must have smaller depth");
+-        // Arbitrary camera translation changes a fixed world's UV by integer texels only.
+-        let moved = camera + DVec3::new(0.013, 0.019, -0.011);
+-        let q = matrix(moved, light).project_point3((camera - moved).as_vec3());
+-        for d in [
+-            (q.x - p.x) * SIZE as f32 * 0.5,
+-            (q.y - p.y) * SIZE as f32 * 0.5,
++        for quality in [
++            SunShadowQuality::Medium,
++            SunShadowQuality::High,
++            SunShadowQuality::Ultra,
+         ] {
+-            assert!((d - d.round()).abs() < 0.001, "unstable texel delta {d}");
+-        }
+-        for angle in [0.0_f32, 45.0, 80.0] {
+-            let a = angle.to_radians();
+-            assert!(matrix(camera, Vec3::new(-a.sin(), a.cos(), 0.0)).is_finite());
++            for angle in [-85.0_f32, -45.0, 0.0, 45.0, 85.0] {
++                let a = angle.to_radians();
++                let light = Vec3::new(-a.sin(), a.cos(), 0.0);
++                for camera in [
++                    DVec3::new(0.013, 64.021, -0.027),
++                    DVec3::new(100000.013, 64.021, -200000.027),
++                    DVec3::new(-29999999.013, 64.021, 29999999.027),
++                ] {
++                    let m = matrix(camera, light, quality);
++                    assert!(m.is_finite());
++                    let p = m.project_point3(Vec3::ZERO);
++                    let toward = m.project_point3(light * 10.0);
++                    assert!(p.z > 0.0 && p.z < 1.0);
++                    assert!(toward.z < p.z, "sunward caster must have smaller depth");
++                    for delta in [
++                        DVec3::new(0.013, 0.019, -0.011),
++                        DVec3::new(-0.06, -0.02, 0.07),
++                        DVec3::new(16.1, 0.0, -16.1),
++                    ] {
++                        let moved = camera + delta;
++                        let q = matrix(moved, light, quality)
++                            .project_point3((camera - moved).as_vec3());
++                        for d in [
++                            (q.x - p.x) * quality.size() as f32 * 0.5,
++                            (q.y - p.y) * quality.size() as f32 * 0.5,
++                        ] {
++                            assert!(
++                                (d - d.round()).abs() < 0.002,
++                                "{quality:?}: unstable texel delta {d}"
++                            );
++                        }
++                    }
++                }
++            }
+         }
+     }
+ }
+diff --git a/crates/horizon-client-render/src/gfx/native_shadow_tests.rs b/crates/horizon-client-render/src/gfx/native_shadow_tests.rs
+index 1d8777d..e8613a1 100644
+--- a/crates/horizon-client-render/src/gfx/native_shadow_tests.rs
++++ b/crates/horizon-client-render/src/gfx/native_shadow_tests.rs
+@@ -5,6 +5,24 @@ use wgpu::util::DeviceExt;
+ 
+ #[test]
+ fn cutout_caster_and_receiver_on_gpu() {
++    run_receiver_test(None);
++}
++
++#[test]
++fn quality_levels_on_gpu() {
++    for quality in [
++        SunShadowQuality::Low,
++        SunShadowQuality::Medium,
++        SunShadowQuality::High,
++        SunShadowQuality::Ultra,
++    ] {
++        run_receiver_test(Some(quality));
++    }
++}
++
++fn run_receiver_test(recipe: Option<SunShadowQuality>) {
++    let quality = recipe.unwrap_or_default();
++    eprintln!("Sunlight recipe: {recipe:?}");
+     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+     let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+         assert!(
+@@ -52,10 +70,15 @@ fn cutout_caster_and_receiver_on_gpu() {
+         sprites: [1.0, 2048.0],
+         format: wgpu::TextureFormat::Rgba8Unorm,
+     };
+-    let shadow = NativeShadow::new(&device, &shape);
++    let shadow = NativeShadow::new(&device, &shape, quality);
+     let data = Uniform {
+         matrix: Mat4::IDENTITY.to_cols_array_2d(),
+-        parameters: [1.0 / SIZE as f32, 32.0, 44.0, 1.0],
++        parameters: [
++            1.0 / quality.size() as f32,
++            quality.fade()[0],
++            quality.fade()[1],
++            1.0,
++        ],
+     };
+     queue.write_buffer(&shadow.uniform, 0, bytemuck::bytes_of(&data));
+     let texture = device.create_texture(&wgpu::TextureDescriptor {
+@@ -144,8 +167,14 @@ fn cutout_caster_and_receiver_on_gpu() {
+     let mut inputs = horizon_shader_api::Frame::zeroed();
+     inputs.sun_direction = [0.0, 1.0, 0.0];
+     queue.write_buffer(&frame.buffer, 0, bytemuck::bytes_of(&inputs));
+-    let source = horizon_shader_api::StageKind::Material.prelude_for("0.1-aurora-shadow.1")
+-        + "
++    let source = horizon_shader_api::StageKind::Material.prelude_for_quality(
++        if recipe.is_some() {
++            "0.1-aurora-shadow.2"
++        } else {
++            "0.1-aurora-shadow.1"
++        },
++        quality,
++    ) + "
+         @vertex fn vs(@builtin(vertex_index) i:u32)->@builtin(position) vec4<f32> {
+             let p=vec2<f32>(f32((i<<1u)&2u),f32(i&2u)); return vec4(p*2.0-1.0,0.0,1.0); }
+         @fragment fn fs(@builtin(position) p:vec4<f32>)->@location(0) vec4<f32> {
+@@ -201,12 +230,13 @@ fn cutout_caster_and_receiver_on_gpu() {
+         view_formats: &[],
+     });
+     let target_view = target.create_view(&Default::default());
+-    for enabled in [true, false] {
++    for requested in [true, false] {
++        let enabled = requested && shadow.enabled();
+         let mut data = data;
+         data.parameters[3] = if enabled { 1.0 } else { 0.0 };
+         queue.write_buffer(&shadow.uniform, 0, bytemuck::bytes_of(&data));
+         let mut encoder = device.create_command_encoder(&Default::default());
+-        {
++        if shadow.enabled() {
+             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                 label: None,
+                 color_attachments: &[],
+diff --git a/crates/horizon-shader-api/src/check.rs b/crates/horizon-shader-api/src/check.rs
+index 7060c56..a8de0a7 100644
+--- a/crates/horizon-shader-api/src/check.rs
++++ b/crates/horizon-shader-api/src/check.rs
+@@ -58,6 +58,7 @@ pub struct CheckedStage {
+     /// The opt-in water.2 material stage needs a pre-translucent scene snapshot.
+     pub scene_snapshot: bool,
+     pub sun_shadow: bool,
++    pub sun_shadow_quality: Option<crate::manifest::SunShadowQuality>,
+     pub file: String,
+     /// The manifest's name for it, else its file.
+     pub label: String,
+@@ -177,7 +178,12 @@ pub fn check_stage(pack: &Pack, kind: StageKind, file: &str) -> Result<CheckedSt
+     Ok(CheckedStage {
+         kind,
+         sun_shadow: kind == StageKind::Material
+-            && pack.manifest.api == crate::manifest::AURORA_SHADOW_API,
++            && crate::manifest::has_sun_shadow(&pack.manifest.api),
++        sun_shadow_quality: if kind == StageKind::Material {
++            pack.manifest.sun_shadows.map(|s| s.quality)
++        } else {
++            None
++        },
+         scene_snapshot: kind == StageKind::Material
+             && crate::manifest::has_scene_snapshot(&pack.manifest.api),
+         file: file.to_owned(),
+diff --git a/crates/horizon-shader-api/src/manifest.rs b/crates/horizon-shader-api/src/manifest.rs
+index ae20beb..d43b6dd 100644
+--- a/crates/horizon-shader-api/src/manifest.rs
++++ b/crates/horizon-shader-api/src/manifest.rs
+@@ -16,14 +16,74 @@ pub const AURORA_SCENE_API: &str = "0.1-aurora-water.2";
+ pub const AURORA_IMMERSION_API: &str = "0.1-aurora-water.3";
+ /// Local directional terrain shadow map, with the water.3 contract.
+ pub const AURORA_SHADOW_API: &str = "0.1-aurora-shadow.1";
++/// Explicit allocation, range and filtering levels; shadow.1 remains unchanged.
++pub const AURORA_SHADOW_QUALITY_API: &str = "0.1-aurora-shadow.2";
++pub fn has_sun_shadow(api: &str) -> bool {
++    matches!(api, AURORA_SHADOW_API | AURORA_SHADOW_QUALITY_API)
++}
+ pub fn has_water_environment(api: &str) -> bool {
+-    matches!(api, AURORA_IMMERSION_API | AURORA_SHADOW_API)
++    api == AURORA_IMMERSION_API || has_sun_shadow(api)
+ }
+ pub fn has_scene_snapshot(api: &str) -> bool {
+-    matches!(
+-        api,
+-        AURORA_SCENE_API | AURORA_IMMERSION_API | AURORA_SHADOW_API
+-    )
++    matches!(api, AURORA_SCENE_API | AURORA_IMMERSION_API) || has_sun_shadow(api)
++}
++
++/// Fixed recipes shared by shader composition and GPU allocation.
++#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
++#[serde(rename_all = "lowercase")]
++pub enum SunShadowQuality {
++    Low,
++    Medium,
++    #[default]
++    High,
++    Ultra,
++}
++impl SunShadowQuality {
++    pub fn enabled(self) -> bool {
++        self != Self::Low
++    }
++    /// Low retains only a dummy binding, with no caster pass.
++    pub fn size(self) -> u32 {
++        match self {
++            Self::Low => 1,
++            Self::Medium => 1024,
++            Self::High => 2048,
++            Self::Ultra => 4096,
++        }
++    }
++    pub fn radius(self) -> f32 {
++        match self {
++            Self::Low | Self::High => 48.0,
++            Self::Medium => 36.0,
++            Self::Ultra => 68.0,
++        }
++    }
++    pub fn fade(self) -> [f32; 2] {
++        match self {
++            Self::Low | Self::High => [32.0, 44.0],
++            Self::Medium => [22.0, 32.0],
++            Self::Ultra => [48.0, 64.0],
++        }
++    }
++    pub fn caster_distance(self) -> f32 {
++        if self == Self::Ultra { 128.0 } else { 96.0 }
++    }
++    pub fn pcf_radius(self) -> i32 {
++        if self == Self::Ultra { 2 } else { 1 }
++    }
++    pub fn bias_scale(self) -> f32 {
++        if self.enabled() {
++            (2.0 * self.radius() / self.size() as f32) / (96.0 / 2048.0)
++        } else {
++            1.0
++        }
++    }
++}
++
++#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
++#[serde(deny_unknown_fields)]
++pub struct SunShadows {
++    pub quality: SunShadowQuality,
+ }
+ /// Full-screen passes a pack may chain.
+ pub const MAX_POST_PASSES: usize = 8;
+@@ -48,6 +108,7 @@ pub struct Manifest {
+     pub shared: Vec<String>,
+     pub sky: Option<Stage>,
+     pub material: Option<Stage>,
++    pub sun_shadows: Option<SunShadows>,
+     /// Full-screen passes, in the order they run.
+     pub post: Vec<Stage>,
+     pub options: Vec<PackOption>,
+@@ -116,6 +177,7 @@ struct Raw {
+     shared: Vec<String>,
+     sky: Option<Stage>,
+     material: Option<Stage>,
++    sun_shadows: Option<SunShadows>,
+     #[serde(default)]
+     post: Vec<Stage>,
+     #[serde(default)]
+@@ -161,9 +223,10 @@ impl Manifest {
+             && raw.api != AURORA_SCENE_API
+             && raw.api != AURORA_IMMERSION_API
+             && raw.api != AURORA_SHADOW_API
++            && raw.api != AURORA_SHADOW_QUALITY_API
+         {
+             return Err(err(format!(
+-                "written for shader API {}; this Horizon serves {API}, {AURORA_WATER_API}, {AURORA_SCENE_API} {AURORA_IMMERSION_API} and {AURORA_SHADOW_API}",
++                "written for shader API {}; this Horizon serves {API}, {AURORA_WATER_API}, {AURORA_SCENE_API}, {AURORA_IMMERSION_API}, {AURORA_SHADOW_API} and {AURORA_SHADOW_QUALITY_API}",
+                 raw.api
+             )));
+         }
+@@ -188,6 +251,15 @@ impl Manifest {
+                 "this API requires a post stage to compose underwater fog".into(),
+             ));
+         }
++        if raw.api == AURORA_SHADOW_QUALITY_API {
++            if raw.sun_shadows.is_none() || raw.material.is_none() {
++                return Err(err(
++                    "shadow.2 requires [sun_shadows] quality and a [material] stage".into(),
++                ));
++            }
++        } else if raw.sun_shadows.is_some() {
++            return Err(err("[sun_shadows] requires API 0.1-aurora-shadow.2".into()));
++        }
+         if raw.post.len() > MAX_POST_PASSES {
+             return Err(err(format!(
+                 "{} post passes; a pack may chain {MAX_POST_PASSES}",
+@@ -234,6 +306,7 @@ impl Manifest {
+             shared: raw.shared,
+             sky: raw.sky,
+             material: raw.material,
++            sun_shadows: raw.sun_shadows,
+             post: raw.post,
+             options,
+             budget: Budget { gpu_ms },
+diff --git a/crates/horizon-shader-api/src/stages.rs b/crates/horizon-shader-api/src/stages.rs
+index ccd95c4..217bb17 100644
+--- a/crates/horizon-shader-api/src/stages.rs
++++ b/crates/horizon-shader-api/src/stages.rs
+@@ -221,6 +221,15 @@ impl StageKind {
+ 
+     /// water.2 changes only the material stage. Existing API lines retain their ABI.
+     pub fn prelude_for(self, api: &str) -> String {
++        self.prelude_for_quality(api, crate::manifest::SunShadowQuality::High)
++    }
++
++    /// The manifest recipe controls receiver filtering as well as map allocation.
++    pub fn prelude_for_quality(
++        self,
++        api: &str,
++        quality: crate::manifest::SunShadowQuality,
++    ) -> String {
+         let mut out = self.prelude();
+         if crate::manifest::has_water_environment(api) {
+             let frame = Frame::WGSL.wgsl();
+@@ -243,6 +252,15 @@ impl StageKind {
+         if self == StageKind::Material && api == crate::manifest::AURORA_SHADOW_API {
+             out += include_str!("sun_shadow.wgsl");
+         }
++        if self == StageKind::Material && api == crate::manifest::AURORA_SHADOW_QUALITY_API {
++            let radius = quality.pcf_radius();
++            out += &format!(
++                "const horizon_sun_pcf_radius: i32 = {radius};\nconst horizon_sun_pcf_count: f32 = {}.0;\nconst horizon_sun_bias_scale: f32 = {:.8};\n",
++                (2 * radius + 1).pow(2),
++                quality.bias_scale()
++            );
++            out += include_str!("sun_shadow_quality.wgsl");
++        }
+         out
+     }
+ 
+@@ -297,7 +315,16 @@ pub fn compose(pack: &Pack, kind: StageKind, file: &str) -> Composed {
+             .parts
+             .push((name.to_owned(), start..composed.text.len()));
+     };
+-    push("<prelude>", &kind.prelude_for(&pack.manifest.api));
++    push(
++        "<prelude>",
++        &kind.prelude_for_quality(
++            &pack.manifest.api,
++            pack.manifest
++                .sun_shadows
++                .map(|s| s.quality)
++                .unwrap_or_default(),
++        ),
++    );
+     for shared in pack.manifest.shared.iter().filter(|s| *s != file) {
+         push(shared, pack.source(shared).unwrap_or_default());
+     }
+diff --git a/crates/horizon-shader-api/src/sun_shadow_quality.wgsl b/crates/horizon-shader-api/src/sun_shadow_quality.wgsl
+new file mode 100644
+index 0000000..facdd93
+--- /dev/null
++++ b/crates/horizon-shader-api/src/sun_shadow_quality.wgsl
+@@ -0,0 +1,31 @@
++// shadow.2 material-only resources; constants come from the checked recipe. Engine-owned group 2 is reserved for this extension.
++struct SunShadow {
++    matrix: mat4x4<f32>,
++    // map texel size, receiver fade start/end (blocks), enabled
++    parameters: vec4<f32>,
++}
++@group(2) @binding(0) var sun_shadow_depth: texture_depth_2d;
++@group(2) @binding(1) var sun_shadow_sampler: sampler_comparison;
++@group(2) @binding(2) var<uniform> sun_shadow: SunShadow;
++
++// Camera-relative position, geometric world normal; 1 means unoccluded sunlight.
++fn sun_visibility(position: vec3<f32>, normal: vec3<f32>) -> f32 {
++    if sun_shadow.parameters.w < 0.5 { return 1.0; }
++    let clip = sun_shadow.matrix * vec4<f32>(position, 1.0);
++    let uv = clip.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
++    let border = sun_shadow.parameters.x * 3.0;
++    if any(uv < vec2<f32>(border)) || any(uv > vec2<f32>(1.0 - border))
++        || clip.z <= 0.0 || clip.z >= 1.0 { return 1.0; }
++    let slope = 1.0 - abs(dot(normal, frame.sun_direction));
++    let reference = clip.z - (0.00015 + 0.0004 * slope) * horizon_sun_bias_scale;
++    var visibility = 0.0;
++    for (var y: i32 = -horizon_sun_pcf_radius; y <= horizon_sun_pcf_radius; y += 1) {
++        for (var x: i32 = -horizon_sun_pcf_radius; x <= horizon_sun_pcf_radius; x += 1) {
++            visibility += textureSampleCompareLevel(sun_shadow_depth, sun_shadow_sampler,
++                uv + vec2<f32>(f32(x), f32(y)) * sun_shadow.parameters.x, reference);
++        }
++    }
++    let edge = smoothstep(0.0, 0.08, min(min(uv.x, uv.y), min(1.0-uv.x, 1.0-uv.y)));
++    let range = 1.0 - smoothstep(sun_shadow.parameters.y, sun_shadow.parameters.z, length(position));
++    return mix(1.0, visibility / horizon_sun_pcf_count, edge * range);
++}
+diff --git a/crates/horizon-shader-api/tests/check.rs b/crates/horizon-shader-api/tests/check.rs
+index d1f8b01..91b7570 100644
+--- a/crates/horizon-shader-api/tests/check.rs
++++ b/crates/horizon-shader-api/tests/check.rs
+@@ -226,3 +226,28 @@ fn sun_shadow_is_opt_in_and_translates_for_metal() {
+         }
+     }
+ }
++
++#[test]
++fn shadow_quality_recipes_translate_for_all_backends() {
++    use horizon_shader_api::manifest::SunShadowQuality;
++    for (name, quality) in [
++        ("low", SunShadowQuality::Low),
++        ("medium", SunShadowQuality::Medium),
++        ("high", SunShadowQuality::High),
++        ("ultra", SunShadowQuality::Ultra),
++    ] {
++        let manifest = format!(
++            "schema=1\nid=\"t\"\nname=\"T\"\nversion=\"1\"\napi=\"0.1-aurora-shadow.2\"\n[sun_shadows]\nquality=\"{name}\"\n[material]\nfile=\"m.wgsl\"\n[[post]]\nfile=\"p.wgsl\"\n"
++        );
++        let files = [(MANIFEST, manifest.as_str()),
++            ("m.wgsl", "fn material(i: MaterialInput) -> Surface { return Surface(vec4(vec3(sun_visibility(i.position,vec3(0.0,1.0,0.0))),1.0),false); }"),
++            ("p.wgsl", "fn post(i: PostInput) -> vec4<f32> { return mix(i.color, vec4(0.0), frame.water.x * frame.water.y); }")]
++            .map(|(k,v)| (k.into(), v.as_bytes().to_vec())).into();
++        let report = check(&Pack::from_files(files).unwrap()).unwrap();
++        assert!(report.water_environment);
++        assert!(report.stages[0].scene_snapshot && report.stages[0].sun_shadow);
++        assert_eq!(report.stages[0].sun_shadow_quality, Some(quality));
++        assert_eq!(report.stages[1].sun_shadow_quality, None);
++        assert!(!report.stages[1].sun_shadow);
++    }
++}
+diff --git a/crates/horizon-shader-api/tests/schema.rs b/crates/horizon-shader-api/tests/schema.rs
+index 8c4d9c3..bd57269 100644
+--- a/crates/horizon-shader-api/tests/schema.rs
++++ b/crates/horizon-shader-api/tests/schema.rs
+@@ -255,3 +255,29 @@ fn immersion_api_requires_a_post_stage() {
+     );
+     assert!(Manifest::parse(&format!("{text}\n[[post]]\nfile=\"p.wgsl\"\n")).is_ok());
+ }
++
++#[test]
++fn shadow_quality_manifest_is_explicit_and_versioned() {
++    let base = "schema=1\nid=\"t\"\nname=\"T\"\nversion=\"1\"\napi=\"0.1-aurora-shadow.2\"\n[material]\nfile=\"m.wgsl\"\n[[post]]\nfile=\"p.wgsl\"\n";
++    assert!(
++        Manifest::parse(base)
++            .unwrap_err()
++            .contains("requires [sun_shadows]")
++    );
++    for quality in ["low", "medium", "high", "ultra"] {
++        let text = format!("{base}\n[sun_shadows]\nquality=\"{quality}\"\n");
++        assert!(Manifest::parse(&text).is_ok());
++        for old in ["0.1", "0.1-aurora-water.3", "0.1-aurora-shadow.1"] {
++            assert!(
++                Manifest::parse(&text.replace("0.1-aurora-shadow.2", old))
++                    .unwrap_err()
++                    .contains("requires API")
++            );
++        }
++        assert!(Manifest::parse(&text.replace("[material]\nfile=\"m.wgsl\"\n", "")).is_err());
++        assert!(Manifest::parse(&format!("{text}size=16384\n")).is_err());
++    }
++    for invalid in ["", "High", "extreme"] {
++        assert!(Manifest::parse(&format!("{base}[sun_shadows]\nquality=\"{invalid}\"\n")).is_err());
++    }
++}
+diff --git a/docs/api/aurora-sun-shadows.md b/docs/api/aurora-sun-shadows.md
+index c5bf3d5..ba2ee94 100644
+--- a/docs/api/aurora-sun-shadows.md
++++ b/docs/api/aurora-sun-shadows.md
+@@ -43,3 +43,39 @@ composition, and an actual GPU caster→receiver check using an opaque/transpare
+ texture. The GPU test explicitly reports a skip without an adapter; setting
+ `AURORA_REQUIRE_GPU=1` makes that condition fail, as the Aurora preview launcher does.
+ Final visual quality and performance must be checked in the running game.
++
++## shadow.2: fixed quality recipes
++
++`0.1-aurora-shadow.2` additionally requires a material stage and this manifest table:
++
++```toml
++[sun_shadows]
++quality = "high" # low, medium, high, ultra; exact lowercase names
++```
++
++Other API lines reject the table. Old shadow.1 still uses its original 2048² map,
++receiver code and ABI. shadow.2 keeps the same 80-byte uniform and water.3 frame ABI.
++The checked manifest carries its recipe through compilation to GPU allocation.
++
++| Quality | Depth32Float map | Raw depth storage | Projection half-width | Receiver fade | PCF taps |
++| --- | --- | --- | --- | --- | --- |
++| Low | 1² dummy | 4 bytes, excluding driver overhead | unused | disabled | none executed |
++| Medium | 1024² | 4 MiB | 36 blocks | 22–32 blocks | 9 |
++| High | 2048² | 16 MiB | 48 blocks | 32–44 blocks | 9 |
++| Ultra | 4096² | 64 MiB | 68 blocks | 48–64 blocks | 25 |
++
++Low returns no light view and skips the entire native shadow render pass (including
++its clear); its receiver uniform disables sampling. A dummy texture and the pipeline
++remain bound. It is not merely `shadow_strength=0`. Other effects are unaffected.
++Ultra's caster radius is 128 blocks instead of 96; actual coverage also depends on
++loaded terrain/detail distance. All levels retain the 0.1–256 light-space depth span.
++Receiver bias scales with world texel width relative to High. Filter constants are
++engine-owned WGSL generated from the recipe, not pack overrides that could disagree
++with allocated resources. High's receiver is mathematically the shadow.1 receiver.
++
++Tests cover all recipes in Metal/SPIR-V/HLSL translation and real terrain composition,
++strict manifest version gating, and camera translation at positive/negative coordinates
++up to the world border at multiple solar angles. `quality_levels_on_gpu` tests Low's
++unrendered dummy fallback plus opaque/cutout reception on the other three map sizes;
++the legacy GPU test remains separate. Live preset switching, moving sun/camera,
++contact bias, water transitions and comparative GPU cost still need game validation.
+-- 
+2.50.1 (Apple Git-155)
+

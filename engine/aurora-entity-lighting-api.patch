@@ -1,0 +1,1237 @@
+diff --git a/crates/horizon-client-render/src/gfx.rs b/crates/horizon-client-render/src/gfx.rs
+index 547542b..672c004 100644
+--- a/crates/horizon-client-render/src/gfx.rs
++++ b/crates/horizon-client-render/src/gfx.rs
+@@ -77,6 +77,7 @@ mod flat;
+ mod hdr;
+ pub mod lightning;
+ mod lod;
++mod native_entity;
+ mod native_material;
+ mod native_pack;
+ mod native_post;
+@@ -468,6 +469,7 @@ pub struct Renderer {
+     screen_buffer: wgpu::Buffer,
+     screen_capacity: u64,
+     entity_group: wgpu::BindGroup,
++    entity_layout: wgpu::BindGroupLayout,
+     /// The entity resources with the hand's projection (`hand_globals`).
+     hand_group: wgpu::BindGroup,
+     hand_globals: wgpu::Buffer,
+@@ -1743,71 +1745,7 @@ impl Renderer {
+             label: Some("Horizon entities"),
+             source: wgpu::ShaderSource::Wgsl(entity_shader().into()),
+         });
+-        let entity_bindings = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+-            label: Some("Entity bindings"),
+-            entries: &[
+-                entry(
+-                    0,
+-                    vf,
+-                    wgpu::BindingType::Buffer {
+-                        ty: wgpu::BufferBindingType::Uniform,
+-                        has_dynamic_offset: false,
+-                        min_binding_size: None,
+-                    },
+-                ),
+-                entry(
+-                    1,
+-                    vf,
+-                    wgpu::BindingType::Texture {
+-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+-                        view_dimension: wgpu::TextureViewDimension::D2,
+-                        multisampled: false,
+-                    },
+-                ),
+-                entry(
+-                    2,
+-                    vf,
+-                    wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+-                ),
+-                entry(
+-                    3,
+-                    vf,
+-                    wgpu::BindingType::Texture {
+-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+-                        view_dimension: wgpu::TextureViewDimension::D2,
+-                        multisampled: false,
+-                    },
+-                ),
+-                entry(
+-                    4,
+-                    vf,
+-                    wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+-                ),
+-                entry(
+-                    5,
+-                    vf,
+-                    wgpu::BindingType::Texture {
+-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+-                        view_dimension: wgpu::TextureViewDimension::D2,
+-                        multisampled: false,
+-                    },
+-                ),
+-                entry(
+-                    6,
+-                    vf,
+-                    wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+-                ),
+-                entry(
+-                    7,
+-                    vf,
+-                    wgpu::BindingType::Texture {
+-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+-                        view_dimension: wgpu::TextureViewDimension::D2,
+-                        multisampled: false,
+-                    },
+-                ),
+-            ],
+-        });
++        let entity_bindings = native_entity::bindings(&device);
+         let weather = weather::Weather::new(
+             &device,
+             config.format.remove_srgb_suffix(),
+@@ -2687,6 +2625,7 @@ impl Renderer {
+             screen_buffer,
+             screen_capacity,
+             entity_group,
++            entity_layout: entity_bindings,
+             hand_group,
+             hand_globals,
+             entity_buffer,
+@@ -3471,6 +3410,19 @@ impl Renderer {
+             .as_ref()
+             .is_some_and(|n| n.water_environment && n.post.is_some())
+     }
++    fn native_entity_pipeline<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, hand: bool) {
++        if let Some(native) = &self.native
++            && let Some(entity) = &native.entity
++        {
++            pass.set_pipeline(if hand { &entity.hand } else { &entity.world });
++            pass.set_bind_group(horizon_shader_api::stages::GROUP, &native.frame.group, &[]);
++            if let Some(shadow) = native.material.as_ref().and_then(|m| m.shadow.as_ref()) {
++                pass.set_bind_group(2, &shadow.receiver, &[]);
++            }
++        } else {
++            pass.set_pipeline(&self.entity_pipeline);
++        }
++    }
+     /// Drops the running shader pack, of either kind.
+     pub fn drop_shader_packs(&mut self) {
+         self.pack_post = None;
+@@ -3494,8 +3446,13 @@ impl Renderer {
+             sprites: self.terrain_sprites,
+             format: self.config.format.remove_srgb_suffix(),
+         };
+-        let (pack, labels) =
+-            native_pack::NativePack::new(&self.device, &terrain, report, &constants)?;
++        let (pack, labels) = native_pack::NativePack::new(
++            &self.device,
++            &terrain,
++            &self.entity_layout,
++            report,
++            &constants,
++        )?;
+         self.native = pack.draws().then_some(pack);
+         if self.native.is_some() {
+             self.pack_post = None;
+@@ -5018,7 +4975,7 @@ impl Renderer {
+                 }
+             }
+             if entity_quads > 0 {
+-                pass.set_pipeline(&self.entity_pipeline);
++                self.native_entity_pipeline(&mut pass, false);
+                 pass.set_bind_group(0, &self.entity_group, &[]);
+                 pass.set_vertex_buffer(0, self.entity_buffer.slice(..));
+                 pass.draw_indexed(0..entity_quads * 6, 0, 0..1);
+@@ -5371,7 +5328,7 @@ impl Renderer {
+                 }),
+                 ..Default::default()
+             });
+-            pass.set_pipeline(&self.entity_pipeline);
++            self.native_entity_pipeline(&mut pass, true);
+             pass.set_bind_group(0, &self.hand_group, &[]);
+             pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
+             pass.set_vertex_buffer(0, self.entity_buffer.slice(..));
+diff --git a/crates/horizon-client-render/src/gfx/native_entity.rs b/crates/horizon-client-render/src/gfx/native_entity.rs
+new file mode 100644
+index 0000000..16a92cf
+--- /dev/null
++++ b/crates/horizon-client-render/src/gfx/native_entity.rs
+@@ -0,0 +1,263 @@
++//! Local lighting.2 model hook. Vanilla alpha, overlays, glint and fog remain
++//! engine-owned. No changes to entity vertex buffers or the stock pipelines.
++use horizon_shader_api::check::CheckedStage;
++
++use super::native_post::{NativeFrame, present_constants};
++use super::native_shadow::NativeShadow;
++
++pub struct NativeEntity {
++    pub world: wgpu::RenderPipeline,
++    pub hand: wgpu::RenderPipeline,
++}
++
++#[cfg(test)]
++#[path = "native_entity_gpu.rs"]
++mod gpu_tests;
++
++/// Same entity resources for vanilla, the opt-in hook, and GPU validation.
++pub fn bindings(device: &wgpu::Device) -> wgpu::BindGroupLayout {
++    let entries: Vec<_> = (0..8)
++        .map(|binding| wgpu::BindGroupLayoutEntry {
++            binding,
++            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
++            count: None,
++            ty: match binding {
++                0 => wgpu::BindingType::Buffer {
++                    ty: wgpu::BufferBindingType::Uniform,
++                    has_dynamic_offset: false,
++                    min_binding_size: None,
++                },
++                2 | 4 | 6 => wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
++                _ => wgpu::BindingType::Texture {
++                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
++                    view_dimension: wgpu::TextureViewDimension::D2,
++                    multisampled: false,
++                },
++            },
++        })
++        .collect();
++    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++        label: Some("Entity bindings"),
++        entries: &entries,
++    })
++}
++
++pub(super) fn shader_source(stage: &CheckedStage) -> String {
++    let mut engine = super::entity_shader();
++    // wgpu reserves one of the default 16 fragment-input variables for
++    // front_facing. Pack the two fog distances into one varying so the
++    // user interface has only 15 variables (locations 0..14).
++    engine = engine
++        .replace(
++            "@location(2) spherical: f32,\n    @location(3) cylindrical: f32,",
++            "@location(2) fog_distances: vec2<f32>,",
++        )
++        .replace("out.spherical", "out.fog_distances.x")
++        .replace("out.cylindrical", "out.fog_distances.y")
++        .replace("in.spherical", "in.fog_distances.x")
++        .replace("in.cylindrical", "in.fog_distances.y");
++    // The raw tint's alpha carries
++    // sky+1 for eligible models, -1 for baked/unlit/effect quads. Original
++    // alpha is still in color.a; position_light.w carries block light.
++    engine = engine.replace("struct Out {", "override NATIVE_HAND: bool = false;\nstruct Out {\n    @location(3) raw_tint: vec4<f32>,\n    @location(14) position_light: vec4<f32>,");
++    engine = engine.replace(
++        "    out.light_color = select(lm, vec4(1.0), unlit);",
++        "
++    out.light_color = select(lm, vec4(1.0), unlit);
++    let model = abs(normal.w) >= 0.5 && !unlit
++        && (overlay == 0u || overlay == 1u || overlay == 5u || overlay == 7u
++            || overlay == 8u || (overlay >= 16u && overlay < 32u) || overlay == 36u);
++    // Explicit fullbright levels also protect emissive model layers that
++    // still carry a normal (e.g. the warden). Baked items keep vanilla.
++    let eligible = model && !(light.x >= 240u && light.y >= 240u);
++    out.raw_tint = vec4(color.rgb, select(-1.0, 1.0 + clamp(l.y / 240.0, 0.0, 1.0), eligible));
++    out.position_light = vec4(position, clamp(l.x / 240.0, 0.0, 1.0));
++",
++    );
++    engine = engine.replace("    var uv = in.uv;", "    let position_dx = dpdx(in.position_light.xyz);\n    let position_dy = dpdy(in.position_light.xyz);\n    var uv = in.uv;");
++    engine = engine.replace("    var color = textureSample(atlas, atlas_sampler, uv) * select(in.back_color, in.color, front);", "    let texel = textureSample(atlas, atlas_sampler, uv);\n    var color = texel * select(in.back_color, in.color, front);");
++    // Exactly this occurrence in fs_entity, before glint. Shadow blobs and
++    // other native entry points remain unchanged and are not used here.
++    engine = engine.replacen("    color *= in.light_color;\n    if in.overlay == 7u", "
++    color *= in.light_color;
++    if in.raw_tint.w >= 1.0 {
++        let albedo = vec4(mix(in.overlay_color.rgb, texel.rgb * in.raw_tint.rgb, in.overlay_color.a), color.a);
++        let custom = entity(EntityInput(albedo, color, in.position_light.xyz,
++            position_dx, position_dy, vec2(in.position_light.w, in.raw_tint.w - 1.0), NATIVE_HAND));
++        color = vec4(custom.rgb, color.a);
++    }
++    if in.overlay == 7u", 1);
++    format!(
++        "{}\n{}",
++        stage.source,
++        super::wgsl_prefix::prefixed(&engine, "horizon_entity_")
++    )
++}
++
++impl NativeEntity {
++    #[allow(clippy::too_many_arguments)]
++    pub fn new(
++        device: &wgpu::Device,
++        entities: &wgpu::BindGroupLayout,
++        frame: &NativeFrame,
++        shadow: Option<&NativeShadow>,
++        stage: &CheckedStage,
++        constants: &[(String, f64)],
++        format: wgpu::TextureFormat,
++    ) -> Result<Self, String> {
++        let text = shader_source(stage);
++        let parsed = naga::front::wgsl::parse_str(&text)
++            .map_err(|e| format!("{}: {}", stage.file, e.emit_to_string(&text)))?;
++        let constants = present_constants(&parsed, constants);
++        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
++        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
++            label: Some(&stage.label),
++            source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(parsed)),
++        });
++        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
++            label: Some("Native entity hook"),
++            bind_group_layouts: &[
++                Some(entities),
++                None,
++                shadow.map(|s| &s.layout),
++                Some(&frame.layout),
++            ],
++            ..Default::default()
++        });
++        let attributes = wgpu::vertex_attr_array![0=>Float32x3,1=>Float32x2,2=>Uint32,3=>Unorm8x4,4=>Uint8x4,5=>Snorm8x4,6=>Float32x2];
++        let pipeline = |hand: bool| {
++            let mut values = constants.clone();
++            values.push(("horizon_entity_NATIVE_HAND", f64::from(hand)));
++            let options = wgpu::PipelineCompilationOptions {
++                constants: &values,
++                ..Default::default()
++            };
++            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
++                label: Some(&stage.label),
++                layout: Some(&layout),
++                vertex: wgpu::VertexState {
++                    module: &module,
++                    entry_point: Some("horizon_entity_vs_entity"),
++                    compilation_options: options.clone(),
++                    buffers: &[Some(wgpu::VertexBufferLayout {
++                        array_stride: std::mem::size_of::<super::Vertex>() as u64,
++                        step_mode: wgpu::VertexStepMode::Vertex,
++                        attributes: &attributes,
++                    })],
++                },
++                primitive: Default::default(),
++                depth_stencil: Some(wgpu::DepthStencilState {
++                    format: wgpu::TextureFormat::Depth32Float,
++                    depth_write_enabled: Some(true),
++                    depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
++                    stencil: Default::default(),
++                    bias: Default::default(),
++                }),
++                multisample: Default::default(),
++                fragment: Some(wgpu::FragmentState {
++                    module: &module,
++                    entry_point: Some("horizon_entity_fs_entity"),
++                    compilation_options: options,
++                    targets: &[Some(wgpu::ColorTargetState {
++                        format,
++                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
++                        write_mask: wgpu::ColorWrites::ALL,
++                    })],
++                }),
++                multiview_mask: None,
++                cache: None,
++            })
++        };
++        let result = Self {
++            world: pipeline(false),
++            hand: pipeline(true),
++        };
++        if let Some(e) = pollster::block_on(scope.pop()) {
++            return Err(format!("{}: {e}", stage.file));
++        }
++        Ok(result)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn entity_interstage_contract_fits_default_limits() {
++        let stage =
++            super::gpu_tests::stage("fn entity(i: EntityInput) -> vec4<f32> { return i.vanilla; }");
++        let text = shader_source(&stage);
++        let module = naga::front::wgsl::parse_str(&text).unwrap();
++        let limit = wgpu::Limits::default().max_inter_stage_shader_variables;
++        let fragment = module
++            .entry_points
++            .iter()
++            .find(|e| e.name == "horizon_entity_fs_entity")
++            .unwrap();
++        let mut variables = 0;
++        let mut builtins = 0;
++        for argument in &fragment.function.arguments {
++            let bindings: Vec<_> = match &argument.binding {
++                Some(binding) => vec![binding],
++                None => match &module.types[argument.ty].inner {
++                    naga::TypeInner::Struct { members, .. } => members
++                        .iter()
++                        .map(|m| m.binding.as_ref().unwrap())
++                        .collect(),
++                    _ => panic!("fragment input must have a binding or be an interface struct"),
++                },
++            };
++            for binding in bindings {
++                match binding {
++                    naga::Binding::Location { location, .. } => {
++                        assert!(
++                            *location < limit,
++                            "input location {location} exceeds {limit}"
++                        );
++                        variables += 1;
++                    }
++                    naga::Binding::BuiltIn(naga::BuiltIn::Position { .. }) => {}
++                    naga::Binding::BuiltIn(
++                        naga::BuiltIn::FrontFacing
++                        | naga::BuiltIn::SampleIndex
++                        | naga::BuiltIn::SampleMask,
++                    ) => builtins += 1,
++                    other => panic!("account for fragment input {other:?} in the limit check"),
++                }
++            }
++        }
++        assert!(
++            variables + builtins <= limit,
++            "{variables} user inputs + {builtins} built-in deductions exceed {limit}"
++        );
++        naga::valid::Validator::new(
++            naga::valid::ValidationFlags::all(),
++            naga::valid::Capabilities::all(),
++        )
++        .validate(&module)
++        .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&text)));
++    }
++
++    #[test]
++    #[ignore = "developer harness: HORIZON_VALIDATE_SHADER_PACK required"]
++    fn local_entity_composes_with_renderer() {
++        let path = std::env::var("HORIZON_VALIDATE_SHADER_PACK").unwrap();
++        let pack = horizon_shader_api::Pack::read(std::path::Path::new(&path)).unwrap();
++        let report = horizon_shader_api::check(&pack).unwrap();
++        let stage = report
++            .stages
++            .iter()
++            .find(|s| s.kind == horizon_shader_api::StageKind::Entity)
++            .unwrap();
++        let text = shader_source(stage);
++        let module = naga::front::wgsl::parse_str(&text)
++            .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&text)));
++        naga::valid::Validator::new(
++            naga::valid::ValidationFlags::all(),
++            naga::valid::Capabilities::all(),
++        )
++        .validate(&module)
++        .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&text)));
++    }
++}
+diff --git a/crates/horizon-client-render/src/gfx/native_entity_gpu.rs b/crates/horizon-client-render/src/gfx/native_entity_gpu.rs
+new file mode 100644
+index 0000000..b8f7fcd
+--- /dev/null
++++ b/crates/horizon-client-render/src/gfx/native_entity_gpu.rs
+@@ -0,0 +1,296 @@
++//! Render/readback contract: clean tint, light order, hand flag, hurt overlay,
++//! glint, alpha cutout, and bypass of baked/unlit/fullbright geometry.
++use super::*;
++use bytemuck::Zeroable;
++use wgpu::util::DeviceExt;
++
++pub(super) fn stage(body: &str) -> CheckedStage {
++    let manifest = "schema=1\nid=\"entity_probe\"\nname=\"Probe\"\nversion=\"1\"\napi=\"0.1-aurora-lighting.2\"\n[sun_shadows]\nquality=\"low\"\n[material]\nfile=\"m.wgsl\"\n[entity]\nfile=\"e.wgsl\"\n[[post]]\nfile=\"p.wgsl\"\n";
++    let files = [
++        (horizon_shader_api::MANIFEST, manifest),
++        (
++            "m.wgsl",
++            "fn material(i: MaterialInput) -> Surface { return Surface(i.albedo, false); }",
++        ),
++        ("e.wgsl", body),
++        (
++            "p.wgsl",
++            "fn post(i: PostInput) -> vec4<f32> { return i.color; }",
++        ),
++    ]
++    .map(|(n, s)| (n.to_owned(), s.as_bytes().to_vec()))
++    .into();
++    horizon_shader_api::check(&horizon_shader_api::Pack::from_files(files).unwrap())
++        .unwrap()
++        .stages
++        .into_iter()
++        .find(|s| s.kind == horizon_shader_api::StageKind::Entity)
++        .unwrap()
++}
++
++#[test]
++fn model_hook_contract_on_gpu() {
++    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
++    let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
++        assert!(
++            std::env::var_os("AURORA_REQUIRE_GPU").is_none(),
++            "Metal adapter required"
++        );
++        eprintln!("SKIP entity contract: no GPU adapter");
++        return;
++    };
++    eprintln!("Entity contract GPU: {:?}", adapter.get_info());
++    let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
++    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
++    let layout = bindings(&device);
++    let frame = NativeFrame::new(&device);
++    // Probe does not read shadows; the real archive GPU test covers those bindings.
++    let identity = NativeEntity::new(
++        &device,
++        &layout,
++        &frame,
++        None,
++        &stage("fn entity(i: EntityInput) -> vec4<f32> { return i.vanilla; }"),
++        &[],
++        wgpu::TextureFormat::Rgba8Unorm,
++    )
++    .unwrap();
++    let probe=NativeEntity::new(&device,&layout,&frame,None,
++        &stage("fn entity(i: EntityInput) -> vec4<f32> { return vec4(i.albedo.r, i.albedo.g * i.light.x, select(i.light.y, 0.9, i.hand), 1.0); }"),&[],wgpu::TextureFormat::Rgba8Unorm).unwrap();
++    let texture = |data: &[u8]| {
++        device
++            .create_texture_with_data(
++                &queue,
++                &wgpu::TextureDescriptor {
++                    label: None,
++                    size: wgpu::Extent3d {
++                        width: (data.len() / 4) as u32,
++                        height: 1,
++                        depth_or_array_layers: 1,
++                    },
++                    mip_level_count: 1,
++                    sample_count: 1,
++                    dimension: wgpu::TextureDimension::D2,
++                    format: wgpu::TextureFormat::Rgba8Unorm,
++                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
++                    view_formats: &[],
++                },
++                wgpu::util::TextureDataOrder::LayerMajor,
++                data,
++            )
++            .create_view(&Default::default())
++    };
++    let atlas = texture(&[255, 255, 255, 255, 255, 255, 255, 0]);
++    let light = texture(&[255, 255, 255, 255]);
++    let glint = texture(&[50, 50, 50, 255]);
++    let sampler = device.create_sampler(&Default::default());
++    let globals = super::super::Globals {
++        view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
++        fog: [1000.0, 2000.0, 1000.0, 2000.0],
++        fog_ends: [1000.0, 1000.0, 0.0, 1.0],
++        ..super::super::Globals::zeroed()
++    };
++    let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
++        label: None,
++        contents: bytemuck::bytes_of(&globals),
++        usage: wgpu::BufferUsages::UNIFORM,
++    });
++    let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
++        label: None,
++        layout: &layout,
++        entries: &[
++            wgpu::BindGroupEntry {
++                binding: 0,
++                resource: uniform.as_entire_binding(),
++            },
++            wgpu::BindGroupEntry {
++                binding: 1,
++                resource: wgpu::BindingResource::TextureView(&atlas),
++            },
++            wgpu::BindGroupEntry {
++                binding: 2,
++                resource: wgpu::BindingResource::Sampler(&sampler),
++            },
++            wgpu::BindGroupEntry {
++                binding: 3,
++                resource: wgpu::BindingResource::TextureView(&light),
++            },
++            wgpu::BindGroupEntry {
++                binding: 4,
++                resource: wgpu::BindingResource::Sampler(&sampler),
++            },
++            wgpu::BindGroupEntry {
++                binding: 5,
++                resource: wgpu::BindingResource::TextureView(&glint),
++            },
++            wgpu::BindGroupEntry {
++                binding: 6,
++                resource: wgpu::BindingResource::Sampler(&sampler),
++            },
++            wgpu::BindGroupEntry {
++                binding: 7,
++                resource: wgpu::BindingResource::TextureView(&glint),
++            },
++        ],
++    });
++    let mut vertices = Vec::new();
++    for case in 0..8 {
++        let x = -1.0 + case as f32 * 0.25;
++        for (dx, y) in [
++            (0.0, -1.0),
++            (0.25, -1.0),
++            (0.0, 1.0),
++            (0.0, 1.0),
++            (0.25, -1.0),
++            (0.25, 1.0),
++        ] {
++            vertices.push(super::super::Vertex {
++                pos: [x + dx, y, 0.5],
++                uv: [if case == 5 { 0.75 } else { 0.25 }, 0.5],
++                layer: match case {
++                    3 => 1,
++                    4 => 7,
++                    6 => 2,
++                    7 => 36,
++                    _ => 0,
++                },
++                color: u32::from_le_bytes([204, 153, 102, 255]),
++                light: if case == 2 {
++                    240 | (240 << 8)
++                } else {
++                    192 | (64 << 8)
++                },
++                normal: if case == 1 { [0; 4] } else { [0, 127, 0, 127] },
++                glint_uv: [0.5; 2],
++            });
++        }
++    }
++    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
++        label: None,
++        contents: bytemuck::cast_slice(&vertices),
++        usage: wgpu::BufferUsages::VERTEX,
++    });
++    let size = wgpu::Extent3d {
++        width: 128,
++        height: 4,
++        depth_or_array_layers: 1,
++    };
++    let target = device.create_texture(&wgpu::TextureDescriptor {
++        label: None,
++        size,
++        mip_level_count: 1,
++        sample_count: 1,
++        dimension: wgpu::TextureDimension::D2,
++        format: wgpu::TextureFormat::Rgba8Unorm,
++        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
++        view_formats: &[],
++    });
++    let depth = device.create_texture(&wgpu::TextureDescriptor {
++        label: None,
++        size,
++        mip_level_count: 1,
++        sample_count: 1,
++        dimension: wgpu::TextureDimension::D2,
++        format: wgpu::TextureFormat::Depth32Float,
++        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
++        view_formats: &[],
++    });
++    let view = target.create_view(&Default::default());
++    let depth_view = depth.create_view(&Default::default());
++    let render = |pipeline: &wgpu::RenderPipeline| {
++        let mut encoder = device.create_command_encoder(&Default::default());
++        {
++            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
++                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
++                    view: &view,
++                    resolve_target: None,
++                    depth_slice: None,
++                    ops: wgpu::Operations {
++                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
++                        store: wgpu::StoreOp::Store,
++                    },
++                })],
++                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
++                    view: &depth_view,
++                    depth_ops: Some(wgpu::Operations {
++                        load: wgpu::LoadOp::Clear(0.0),
++                        store: wgpu::StoreOp::Discard,
++                    }),
++                    stencil_ops: None,
++                }),
++                ..Default::default()
++            });
++            pass.set_pipeline(pipeline);
++            pass.set_bind_group(0, &group, &[]);
++            pass.set_bind_group(3, &frame.group, &[]);
++            pass.set_vertex_buffer(0, buffer.slice(..));
++            pass.draw(0..vertices.len() as u32, 0..1);
++        }
++        let read = device.create_buffer(&wgpu::BufferDescriptor {
++            label: None,
++            size: 2048,
++            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
++            mapped_at_creation: false,
++        });
++        encoder.copy_texture_to_buffer(
++            target.as_image_copy(),
++            wgpu::TexelCopyBufferInfo {
++                buffer: &read,
++                layout: wgpu::TexelCopyBufferLayout {
++                    offset: 0,
++                    bytes_per_row: Some(512),
++                    rows_per_image: None,
++                },
++            },
++            size,
++        );
++        queue.submit([encoder.finish()]);
++        let (send, recv) = std::sync::mpsc::channel();
++        read.slice(..)
++            .map_async(wgpu::MapMode::Read, move |r| send.send(r).unwrap());
++        device
++            .poll(wgpu::PollType::Wait {
++                submission_index: None,
++                timeout: None,
++            })
++            .unwrap();
++        recv.recv().unwrap().unwrap();
++        let bytes = read.slice(..).get_mapped_range().unwrap();
++        let pixels: Vec<[u8; 4]> = (0..8)
++            .map(|i| {
++                bytes[512 + (i * 16 + 8) * 4..512 + (i * 16 + 8) * 4 + 4]
++                    .try_into()
++                    .unwrap()
++            })
++            .collect();
++        drop(bytes);
++        read.unmap();
++        pixels
++    };
++    let base = render(&identity.world);
++    let world = render(&probe.world);
++    let hand = render(&probe.hand);
++    for i in [1, 2, 5, 6] {
++        assert_eq!(world[i], base[i], "bypass case {i}");
++        assert_eq!(hand[i], base[i], "hand bypass {i}");
++    }
++    assert_eq!(&world[5][..3], &[0, 0, 0], "alpha discard");
++    for (have, want) in world[0][..3].iter().zip([204, 41, 204]) {
++        assert!(
++            (i32::from(*have) - want).abs() <= 1,
++            "clean tint/light order: {:?}",
++            world[0]
++        );
++    }
++    assert!((i32::from(hand[0][2]) - 230).abs() <= 1, "hand flag");
++    assert!(world[3][1] < world[0][1], "hurt overlay before lighting");
++    for i in [4, 7] {
++        for channel in 0..3 {
++            assert!(
++                (i32::from(world[i][channel]) - i32::from(world[0][channel]) - 10).abs() <= 1,
++                "glint after lighting"
++            );
++        }
++    }
++    assert!(pollster::block_on(scope.pop()).is_none());
++}
+diff --git a/crates/horizon-client-render/src/gfx/native_material.rs b/crates/horizon-client-render/src/gfx/native_material.rs
+index bae1bac..071cfa6 100644
+--- a/crates/horizon-client-render/src/gfx/native_material.rs
++++ b/crates/horizon-client-render/src/gfx/native_material.rs
+@@ -528,8 +528,14 @@ mod tests {
+             sprites: [1.0, 2048.0],
+             format: wgpu::TextureFormat::Rgba8Unorm,
+         };
+-        let (_, labels) =
+-            super::super::native_pack::NativePack::new(&device, &shape, report, &[]).unwrap();
++        let (_, labels) = super::super::native_pack::NativePack::new(
++            &device,
++            &shape,
++            &super::super::native_entity::bindings(&device),
++            report,
++            &[],
++        )
++        .unwrap();
+         assert!(!labels.is_empty());
+         eprintln!("Compiled local pack pipelines: {labels:?}");
+     }
+diff --git a/crates/horizon-client-render/src/gfx/native_pack.rs b/crates/horizon-client-render/src/gfx/native_pack.rs
+index cf9bf9a..7c76827 100644
+--- a/crates/horizon-client-render/src/gfx/native_pack.rs
++++ b/crates/horizon-client-render/src/gfx/native_pack.rs
+@@ -14,6 +14,7 @@ pub struct NativePack {
+     pub frame: NativeFrame,
+     pub sky: Option<NativeSky>,
+     pub material: Option<NativeMaterial>,
++    pub entity: Option<super::native_entity::NativeEntity>,
+     pub post: Option<NativePost>,
+     /// GPU time of each pass, while the renderer asks for it (`pack_timing.rs`).
+     pub timing: Option<PassTiming>,
+@@ -27,6 +28,7 @@ impl NativePack {
+     pub fn new(
+         device: &wgpu::Device,
+         terrain: &TerrainShape<'_>,
++        entities: &wgpu::BindGroupLayout,
+         report: Report,
+         constants: &[(String, f64)],
+     ) -> Result<(Self, Vec<String>), String> {
+@@ -47,6 +49,21 @@ impl NativePack {
+             .find(|s| s.kind == StageKind::Material)
+             .map(|stage| NativeMaterial::new(device, terrain, &frame, stage, constants))
+             .transpose()?;
++        let entity = others
++            .iter()
++            .find(|s| s.kind == StageKind::Entity)
++            .map(|stage| {
++                super::native_entity::NativeEntity::new(
++                    device,
++                    entities,
++                    &frame,
++                    material.as_ref().and_then(|m| m.shadow.as_ref()),
++                    stage,
++                    constants,
++                    format,
++                )
++            })
++            .transpose()?;
+         let post = (!post.is_empty())
+             .then(|| {
+                 if post.iter().any(|s| s.sun_shadow) {
+@@ -70,6 +87,12 @@ impl NativePack {
+                 .filter(|s| material.is_some() && s.kind == StageKind::Material)
+                 .map(|s| s.label.clone()),
+         );
++        labels.extend(
++            others
++                .iter()
++                .filter(|s| s.kind == StageKind::Entity)
++                .map(|s| s.label.clone()),
++        );
+         if let Some(post) = &post {
+             labels.extend(post.labels().into_iter().map(str::to_owned));
+         }
+@@ -79,6 +102,7 @@ impl NativePack {
+             frame,
+             sky,
+             material,
++            entity,
+             post,
+             timing: None,
+         };
+diff --git a/crates/horizon-shader-api/src/check.rs b/crates/horizon-shader-api/src/check.rs
+index 0edc416..406b73c 100644
+--- a/crates/horizon-shader-api/src/check.rs
++++ b/crates/horizon-shader-api/src/check.rs
+@@ -92,6 +92,7 @@ pub fn check(pack: &Pack) -> Result<Report, Vec<Problem>> {
+         .iter()
+         .map(|s| (StageKind::Sky, s))
+         .chain(m.material.iter().map(|s| (StageKind::Material, s)))
++        .chain(m.entity.iter().map(|s| (StageKind::Entity, s)))
+         .chain(m.post.iter().map(|s| (StageKind::Post, s)));
+     let (mut checked, mut problems) = (Vec::new(), Vec::new());
+     for (kind, stage) in stages {
+@@ -187,13 +188,13 @@ pub fn check_stage(pack: &Pack, kind: StageKind, file: &str) -> Result<CheckedSt
+     Ok(CheckedStage {
+         kind,
+         temporal_api: crate::manifest::has_temporal(&pack.manifest.api),
+-        clean_lighting: pack.manifest.api == crate::manifest::AURORA_LIGHTING_API,
++        clean_lighting: crate::manifest::has_clean_lighting(&pack.manifest.api),
+         resolution_divisor: post.and_then(|s| s.resolution_divisor).unwrap_or(1),
+         history: post.and_then(|s| s.history).unwrap_or(false),
+-        sun_shadow: (kind == StageKind::Material
++        sun_shadow: (matches!(kind, StageKind::Material | StageKind::Entity)
+             && crate::manifest::has_sun_shadow(&pack.manifest.api))
+             || (kind == StageKind::Post && crate::manifest::has_atmosphere(&pack.manifest.api)),
+-        sun_shadow_quality: if kind == StageKind::Material
++        sun_shadow_quality: if matches!(kind, StageKind::Material | StageKind::Entity)
+             || (kind == StageKind::Post && crate::manifest::has_atmosphere(&pack.manifest.api))
+         {
+             pack.manifest.sun_shadows.map(|s| s.quality)
+diff --git a/crates/horizon-shader-api/src/inputs.rs b/crates/horizon-shader-api/src/inputs.rs
+index a70c74e..2bf2834 100644
+--- a/crates/horizon-shader-api/src/inputs.rs
++++ b/crates/horizon-shader-api/src/inputs.rs
+@@ -180,6 +180,21 @@ pub const MATERIAL_INPUT: Struct = Struct {
+     },
+ };
+ 
++/// Local lighting.2: lit model fragment before glint and native fog.
++pub const ENTITY_INPUT: Struct = Struct {
++    name: "EntityInput",
++    doc: "Lit model/arm fragment; fullbright layers, particles and baked-colour quads bypass it.",
++    fields: fields! {
++        albedo: "vec4<f32>" = "Texture times clean tint, with hurt/flash overlay applied, before lighting.",
++        vanilla: "vec4<f32>" = "Original lit colour, including overlay, before glint and fog.",
++        position: "vec3<f32>" = "Camera-relative world position, including for the hand.",
++        position_dx: "vec3<f32>" = "dpdx(position), computed before divergent branches/discard.",
++        position_dy: "vec3<f32>" = "dpdy(position), computed before divergent branches/discard.",
++        light: "vec2<f32>" = "Block and sky levels divided by 15, including dynamic block light.",
++        hand: "bool" = "First-person pass, drawn after post-processing; world projection does not apply.",
++    },
++};
++
+ /// What the material stage returns.
+ pub const SURFACE: Struct = Struct {
+     name: "Surface",
+diff --git a/crates/horizon-shader-api/src/manifest.rs b/crates/horizon-shader-api/src/manifest.rs
+index e0c9be2..9536879 100644
+--- a/crates/horizon-shader-api/src/manifest.rs
++++ b/crates/horizon-shader-api/src/manifest.rs
+@@ -24,13 +24,21 @@ pub const AURORA_ATMOSPHERE_API: &str = "0.1-aurora-atmosphere.1";
+ pub const AURORA_TEMPORAL_API: &str = "0.1-aurora-atmosphere.2";
+ /// Clean terrain tint and AO for independent sunlight / sky / local lighting.
+ pub const AURORA_LIGHTING_API: &str = "0.1-aurora-lighting.1";
++/// Local opt-in entity/hand fragment hook, extending lighting.1.
++pub const AURORA_ENTITY_API: &str = "0.1-aurora-lighting.2";
++pub fn has_clean_lighting(api: &str) -> bool {
++    matches!(api, AURORA_LIGHTING_API | AURORA_ENTITY_API)
++}
+ pub fn has_temporal(api: &str) -> bool {
+-    matches!(api, AURORA_TEMPORAL_API | AURORA_LIGHTING_API)
++    matches!(
++        api,
++        AURORA_TEMPORAL_API | AURORA_LIGHTING_API | AURORA_ENTITY_API
++    )
+ }
+ pub fn has_atmosphere(api: &str) -> bool {
+     matches!(
+         api,
+-        AURORA_ATMOSPHERE_API | AURORA_TEMPORAL_API | AURORA_LIGHTING_API
++        AURORA_ATMOSPHERE_API | AURORA_TEMPORAL_API | AURORA_LIGHTING_API | AURORA_ENTITY_API
+     )
+ }
+ pub fn has_sun_shadow(api: &str) -> bool {
+@@ -41,6 +49,7 @@ pub fn has_sun_shadow(api: &str) -> bool {
+             | AURORA_ATMOSPHERE_API
+             | AURORA_TEMPORAL_API
+             | AURORA_LIGHTING_API
++            | AURORA_ENTITY_API
+     )
+ }
+ pub fn has_water_environment(api: &str) -> bool {
+@@ -137,6 +146,8 @@ pub struct Manifest {
+     pub shared: Vec<String>,
+     pub sky: Option<Stage>,
+     pub material: Option<Stage>,
++    /// Local lighting.2 hook for lit model entities and the first-person arm.
++    pub entity: Option<Stage>,
+     pub sun_shadows: Option<SunShadows>,
+     pub atmosphere: Option<Atmosphere>,
+     /// Full-screen passes, in the order they run.
+@@ -211,6 +222,7 @@ struct Raw {
+     shared: Vec<String>,
+     sky: Option<Stage>,
+     material: Option<Stage>,
++    entity: Option<Stage>,
+     sun_shadows: Option<SunShadows>,
+     atmosphere: Option<Atmosphere>,
+     #[serde(default)]
+@@ -262,12 +274,18 @@ impl Manifest {
+             && raw.api != AURORA_ATMOSPHERE_API
+             && raw.api != AURORA_TEMPORAL_API
+             && raw.api != AURORA_LIGHTING_API
++            && raw.api != AURORA_ENTITY_API
+         {
+             return Err(err(format!(
+-                "written for shader API {}; this Horizon serves {API}, {AURORA_WATER_API}, {AURORA_SCENE_API}, {AURORA_IMMERSION_API}, {AURORA_SHADOW_API}, {AURORA_SHADOW_QUALITY_API}, {AURORA_ATMOSPHERE_API}, {AURORA_TEMPORAL_API} and {AURORA_LIGHTING_API}",
++                "written for shader API {}; this Horizon serves {API}, {AURORA_WATER_API}, {AURORA_SCENE_API}, {AURORA_IMMERSION_API}, {AURORA_SHADOW_API}, {AURORA_SHADOW_QUALITY_API}, {AURORA_ATMOSPHERE_API}, {AURORA_TEMPORAL_API}, {AURORA_LIGHTING_API} and {AURORA_ENTITY_API}",
+                 raw.api
+             )));
+         }
++        if raw.entity.is_some() && raw.api != AURORA_ENTITY_API {
++            return Err(err(
++                "[entity] requires local API 0.1-aurora-lighting.2".into()
++            ));
++        }
+         let id_ok = (1..=64).contains(&raw.id.len())
+             && raw
+                 .id
+@@ -295,6 +313,7 @@ impl Manifest {
+                 | AURORA_ATMOSPHERE_API
+                 | AURORA_TEMPORAL_API
+                 | AURORA_LIGHTING_API
++                | AURORA_ENTITY_API
+         ) {
+             if raw.sun_shadows.is_none() || raw.material.is_none() {
+                 return Err(err(
+@@ -315,7 +334,7 @@ impl Manifest {
+                 return Err(err("custom_celestials requires a [sky] stage".into()));
+             }
+         }
+-        for stage in raw.sky.iter().chain(&raw.material) {
++        for stage in raw.sky.iter().chain(&raw.material).chain(&raw.entity) {
+             if stage.resolution_divisor.is_some() || stage.history.is_some() {
+                 return Err(err("resolution_divisor and history are post-only".into()));
+             }
+@@ -347,7 +366,12 @@ impl Manifest {
+                 raw.post.len()
+             )));
+         }
+-        let stages = raw.sky.iter().chain(&raw.material).chain(&raw.post);
++        let stages = raw
++            .sky
++            .iter()
++            .chain(&raw.material)
++            .chain(&raw.entity)
++            .chain(&raw.post);
+         for file in raw.shared.iter().chain(stages.map(|s| &s.file)) {
+             if !crate::package::plain_path(file) || !file.ends_with(".wgsl") {
+                 return Err(err(format!("{file:?} is not a plain path to a .wgsl file")));
+@@ -387,6 +411,7 @@ impl Manifest {
+             shared: raw.shared,
+             sky: raw.sky,
+             material: raw.material,
++            entity: raw.entity,
+             sun_shadows: raw.sun_shadows,
+             atmosphere: raw.atmosphere,
+             post: raw.post,
+@@ -398,7 +423,12 @@ impl Manifest {
+     /// Every WGSL file the manifest names, shared files first, each once.
+     pub fn files(&self) -> Vec<&str> {
+         let mut files: Vec<&str> = Vec::new();
+-        let stages = self.sky.iter().chain(&self.material).chain(&self.post);
++        let stages = self
++            .sky
++            .iter()
++            .chain(&self.material)
++            .chain(&self.entity)
++            .chain(&self.post);
+         for file in self.shared.iter().chain(stages.map(|s| &s.file)) {
+             if !files.contains(&file.as_str()) {
+                 files.push(file);
+diff --git a/crates/horizon-shader-api/src/reference.rs b/crates/horizon-shader-api/src/reference.rs
+index df74b76..f712ab4 100644
+--- a/crates/horizon-shader-api/src/reference.rs
++++ b/crates/horizon-shader-api/src/reference.rs
+@@ -45,6 +45,7 @@ pub fn markdown() -> String {
+             StageKind::Post => "[[post]]",
+             StageKind::Sky => "[sky]",
+             StageKind::Material => "[material]",
++            StageKind::Entity => "[entity] (local lighting.2 only)",
+         };
+         out += &format!("| {} | `{key}` | `{}` |\n", kind.name(), kind.signature());
+     }
+diff --git a/crates/horizon-shader-api/src/stages.rs b/crates/horizon-shader-api/src/stages.rs
+index f38c7b5..619a9e6 100644
+--- a/crates/horizon-shader-api/src/stages.rs
++++ b/crates/horizon-shader-api/src/stages.rs
+@@ -2,7 +2,7 @@
+ //! that Horizon calls inside its own passes, and the WGSL put around a
+ //! pack's files to build a stage: the prelude before (the inputs and the
+ //! resources), the entry points after.
+-use crate::inputs::{Frame, MATERIAL_INPUT, POST_INPUT, SKY_INPUT, SURFACE, Struct};
++use crate::inputs::{ENTITY_INPUT, Frame, MATERIAL_INPUT, POST_INPUT, SKY_INPUT, SURFACE, Struct};
+ use crate::package::Pack;
+ 
+ /// The bind group of a pack's resources; groups 0 to 2 are the renderer's.
+@@ -14,6 +14,8 @@ pub enum StageKind {
+     Sky,
+     /// The colour of block surfaces (terrain), before the alpha test and fog.
+     Material,
++    /// Local lighting.2: lit model entities and the first-person arm.
++    Entity,
+     /// A full-screen pass over the world's picture, under the hand and HUD.
+     Post,
+ }
+@@ -151,7 +153,23 @@ struct HorizonSkyIn {
+ }
+ ";
+ 
++const ENTITY_ENTRIES: &str = "
++struct HorizonEntityIn {
++    @builtin(position) pixel: vec4<f32>,
++    @location(0) albedo: vec4<f32>,
++    @location(1) vanilla: vec4<f32>,
++    @location(2) position: vec3<f32>,
++    @location(3) light: vec2<f32>,
++    @location(4) @interpolate(flat) hand: u32,
++}
++@fragment fn horizon_fs_entity(in: HorizonEntityIn) -> @location(0) vec4<f32> {
++    return entity(EntityInput(in.albedo, in.vanilla, in.position,
++        dpdx(in.position), dpdy(in.position), in.light, in.hand != 0u));
++}
++";
++
+ impl StageKind {
++    /// Stable public stages; Entity is gated by the local lighting.2 manifest.
+     pub const ALL: [StageKind; 3] = [StageKind::Sky, StageKind::Material, StageKind::Post];
+ 
+     /// The manifest's name for the stage (`[sky]`, `[material]`, `[[post]]`).
+@@ -159,6 +177,7 @@ impl StageKind {
+         match self {
+             StageKind::Sky => "sky",
+             StageKind::Material => "material",
++            StageKind::Entity => "entity",
+             StageKind::Post => "post",
+         }
+     }
+@@ -172,6 +191,7 @@ impl StageKind {
+         match self {
+             StageKind::Sky => &SKY_INPUT,
+             StageKind::Material => &MATERIAL_INPUT,
++            StageKind::Entity => &ENTITY_INPUT,
+             StageKind::Post => &POST_INPUT,
+         }
+     }
+@@ -180,7 +200,7 @@ impl StageKind {
+     pub fn output(self) -> &'static str {
+         match self {
+             StageKind::Material => SURFACE.name,
+-            StageKind::Sky | StageKind::Post => "vec4<f32>",
++            StageKind::Sky | StageKind::Entity | StageKind::Post => "vec4<f32>",
+         }
+     }
+ 
+@@ -197,7 +217,9 @@ impl StageKind {
+     pub fn resources(self) -> &'static [Resource] {
+         match self {
+             StageKind::Post => &POST_RESOURCES,
+-            StageKind::Sky | StageKind::Material => std::slice::from_ref(&FRAME),
++            StageKind::Sky | StageKind::Material | StageKind::Entity => {
++                std::slice::from_ref(&FRAME)
++            }
+         }
+     }
+ 
+@@ -252,7 +274,7 @@ impl StageKind {
+             );
+             out += SCENE_PRELUDE;
+         }
+-        if self == StageKind::Material && api == crate::manifest::AURORA_LIGHTING_API {
++        if self == StageKind::Material && crate::manifest::has_clean_lighting(api) {
+             out = out.replace("    fog: vec4<f32>,", "    fog: vec4<f32>,\n    // RGB: unshaded biome tint; alpha: AO, zero means unavailable.\n    lighting: vec4<f32>,");
+         }
+         if self == StageKind::Material && api == crate::manifest::AURORA_SHADOW_API {
+@@ -283,6 +305,7 @@ impl StageKind {
+         match self {
+             StageKind::Sky => SKY_ENTRIES,
+             StageKind::Material => MATERIAL_ENTRIES,
++            StageKind::Entity => ENTITY_ENTRIES,
+             StageKind::Post => POST_ENTRIES,
+         }
+     }
+@@ -353,7 +376,7 @@ pub fn compose(pack: &Pack, kind: StageKind, file: &str) -> Composed {
+             kind.entries().to_owned()
+         };
+     let entries = if kind == StageKind::Material
+-        && pack.manifest.api == crate::manifest::AURORA_LIGHTING_API
++        && crate::manifest::has_clean_lighting(&pack.manifest.api)
+     {
+         entries.replace("    @location(7) @interpolate(flat) is_water: u32,", "    @location(7) @interpolate(flat) is_water: u32,\n    @location(8) lighting: vec4<f32>,")
+             .replace("vec4(frame.fog_color, 0.0));", "vec4(frame.fog_color, 0.0), in.lighting);")
+diff --git a/crates/horizon-shader-api/tests/entities.rs b/crates/horizon-shader-api/tests/entities.rs
+new file mode 100644
+index 0000000..d2a1017
+--- /dev/null
++++ b/crates/horizon-shader-api/tests/entities.rs
+@@ -0,0 +1,35 @@
++use horizon_shader_api::{Pack, StageKind, check};
++
++fn files(api: &str) -> std::collections::BTreeMap<String, Vec<u8>> {
++    let manifest = format!(
++        "schema=1\nid=\"entity\"\nname=\"Entity\"\nversion=\"1\"\napi=\"{api}\"\n[sun_shadows]\nquality=\"high\"\n[material]\nfile=\"m.wgsl\"\n[entity]\nfile=\"e.wgsl\"\n[[post]]\nfile=\"p.wgsl\"\n"
++    );
++    [
++        (horizon_shader_api::MANIFEST,manifest.as_str()),
++        ("m.wgsl","fn material(i: MaterialInput) -> Surface { return Surface(vec4(i.lighting.rgb, i.albedo.a), false); }"),
++        ("e.wgsl","fn entity(i: EntityInput) -> vec4<f32> { return i.vanilla; }"),
++        ("p.wgsl","fn post(i: PostInput) -> vec4<f32> { return i.color; }"),
++    ].map(|(n,s)|(n.to_owned(),s.as_bytes().to_vec())).into()
++}
++
++#[test]
++fn entity_hook_is_opt_in_and_does_not_get_the_scene_snapshot() {
++    let pack = Pack::from_files(files("0.1-aurora-lighting.2")).unwrap();
++    let bytes = pack.package().unwrap();
++    assert!(!bytes.is_empty());
++    assert!(pack.manifest.files().contains(&"e.wgsl"));
++    let report = check(&pack).unwrap();
++    let stage = report
++        .stages
++        .iter()
++        .find(|s| s.kind == StageKind::Entity)
++        .unwrap();
++    assert!(stage.sun_shadow && stage.clean_lighting);
++    assert!(!stage.scene_snapshot);
++    assert!(stage.source.contains("position_dx: vec3<f32>"));
++    assert!(!stage.source.contains("pre_translucent_color"));
++    for api in ["0.1", "0.1-aurora-atmosphere.2", "0.1-aurora-lighting.1"] {
++        let error = Pack::from_files(files(api)).unwrap_err();
++        assert!(error.contains("[entity] requires"), "{error}");
++    }
++}
+diff --git a/crates/horizon-shader-api/tests/reference.rs b/crates/horizon-shader-api/tests/reference.rs
+index dd19c47..f728b8d 100644
+--- a/crates/horizon-shader-api/tests/reference.rs
++++ b/crates/horizon-shader-api/tests/reference.rs
+@@ -31,6 +31,9 @@ fn vanilla(kind: StageKind) -> &'static str {
+             "fn material(input: MaterialInput) -> Surface {\n    \
+              return Surface(input.albedo * input.tint * vec4<f32>(input.lightmap, 1.0));\n}\n"
+         }
++        StageKind::Entity => {
++            "fn entity(input: EntityInput) -> vec4<f32> { return input.vanilla; }\n"
++        }
+         StageKind::Post => "fn post(input: PostInput) -> vec4<f32> { return input.color; }\n",
+     }
+ }
+diff --git a/docs/aurora-entities.md b/docs/aurora-entities.md
+new file mode 100644
+index 0000000..f165050
+--- /dev/null
++++ b/docs/aurora-entities.md
+@@ -0,0 +1,65 @@
++# Local Aurora entity lighting API
++
++`0.1-aurora-lighting.2` extends lighting.1 with an optional `[entity]` stage.
++This is a local fork API, not an upstream compatibility promise. Packs without
++this stage retain the stock entity pipeline; older API names reject the field.
++The manifest otherwise inherits lighting.1 (material, post and shadow requirements).
++
++```toml
++[entity]
++file = "entity.wgsl"
++name = "Model lighting"
++```
++
++The function is `fn entity(input: EntityInput) -> vec4<f32>`:
++
++| Field | Meaning |
++| --- | --- |
++| albedo | Atlas texel times clean vertex tint, with hurt/flash overlay applied |
++| vanilla | Original fully lit colour before glint and fog; useful for fallback |
++| position | Camera-relative position in world axes, including first-person arms |
++| position_dx, position_dy | Derivatives computed before alpha discard and eligibility branches |
++| light | Normalized block light (including dynamic lights), then sky light |
++| hand | True only for the first-person pass, which follows world post-processing |
++
++Only returned RGB is used. The engine owns alpha, alpha testing, culling, glint
++and final fog. Frame is at group 3, binding 0; the existing terrain sun-shadow
++receiver is at group 2. There is no scene snapshot or cloud history binding.
++Native entity pipelines have separate world/hand override constants and use
++the original entity resources and vertex format. The two fog distances share a
++vec2 varying, leaving 15 user variables (locations 0..14) plus one built-in
++deduction for front_facing within the default limit of 16. Vertex stride and
++frame uniform ABI do not change.
++
++The hook runs on ordinary normal-shaded model vertices in the primary entity
++batch and first-person batch. Baked faces, unlit/effect overlays, particles in
++their separate pass, and explicit fullbright vertices retain vanilla lighting.
++Fullbright is identified by both original light bytes being 240 or greater;
++ordinary geometry at that exact light combination also follows the fallback.
++Item geometry with baked lighting is not relit. Specialized passes such as
++energy swirls, text and glowing outlines are unchanged.
++
++This adds shadow reception, not entity shadow casting. Terrain shadow casters
++are unchanged. Pack fallback remains necessary for other dimensions and visual
++effects. A pack must account for the hand being drawn after the world post chain.
++
++## Validation
++
++- Shader API test verifies opt-in gating, inclusion in the archive and no scene snapshot.
++- Developer composition harness validates an actual pack against the full entity WGSL.
++- `entity_interstage_contract_fits_default_limits` checks the actual fragment
++  interface against default wgpu limits, including built-in deductions. It
++  reproduces the first Metal launch failure (16 user variables plus front_facing)
++  before the fog-distance packing fix and passes afterwards, without a GPU.
++- `gfx::native_entity::gpu_tests::model_hook_contract_on_gpu` renders and reads
++  back normal/hand, baked, fullbright, hurt, item glint, armour glint, unlit and
++  transparent cases. Set `AURORA_REQUIRE_GPU=1` to fail instead of skipping when
++  no adapter is available.
++- `local_pack_pipelines_on_gpu` now builds both entity variants as part of the
++  actual pack. Run with `HORIZON_VALIDATE_SHADER_PACK=<archive>` and `--ignored`.
++
++The first Terminal run passed four shadow tests and temporal history on Apple M3
++Pro / Metal, then failed at entity pipeline creation due to the interface limit.
++The corrected model contract and whole-pack hardware tests await the next
++Terminal run; the agent environment has no Metal adapter. In-world acceptance
++is still pending.
